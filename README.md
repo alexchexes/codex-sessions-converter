@@ -2,19 +2,19 @@
 
 Convert Codex session rollout JSONL files into readable Markdown or YAML.
 
-The main use case is turning files from a Codex home directory such as
-`sessions/2026/04/26/rollout-....jsonl` into a dialogue-oriented Markdown file:
+It turns files from a Codex home directory such as
+`~/.codex/sessions/YYYY/MM/DD/rollout-<...>.jsonl` into a more readable YAML, or a dialogue-oriented Markdown file:
 
 ```md
 # User:
 
-...
+<...>
 
 ---
 
 # Codex:
 
-...
+<...>
 ```
 
 ## Install
@@ -43,19 +43,19 @@ python -m codex_sessions_converter --help
 Convert to YAML:
 
 ```bash
-codex-sessions-converter sessions/2026/04/26/rollout.jsonl rollout.yaml
+codex-sessions-converter sessions/YYYY/MM/DD/rollout.jsonl rollout.yaml
 ```
 
 Convert to Markdown:
 
 ```bash
-codex-sessions-converter sessions/2026/04/26/rollout.jsonl rollout.md
+codex-sessions-converter sessions/YYYY/MM/DD/rollout.jsonl rollout.md
 ```
 
 Use Markdown explicitly when no `.md` output path is supplied:
 
 ```bash
-codex-sessions-converter --format md sessions/2026/04/26/rollout.jsonl
+codex-sessions-converter --format md sessions/YYYY/MM/DD/rollout.jsonl
 ```
 
 ## Markdown Detail
@@ -103,10 +103,28 @@ render full tool details, and presets without tools omit them. Explicit
   with `<br>`.
 - The converter uses only the Python standard library.
 
+## License
+
+MIT
+
 ## Development
+
+Install development tools:
+
+```bash
+pip install -e ".[dev]"
+```
 
 Run the test suite:
 
 ```bash
 python -m unittest discover -s tests
+```
+
+Run formatting, linting, and type checks:
+
+```bash
+python -m ruff format .
+python -m ruff check .
+python -m mypy
 ```

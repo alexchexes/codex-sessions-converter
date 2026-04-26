@@ -2,10 +2,10 @@ import argparse
 import json
 import math
 import re
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
-
+from typing import Any, TextIO
 
 __version__ = "0.1.0"
 
@@ -508,7 +508,13 @@ def render_tool_output(
         )
         language = "json"
     if mode == "preview":
-        lines.extend(["", "Output preview:", fenced_block(truncate_preview(body, preview_chars), language)])
+        lines.extend(
+            [
+                "",
+                "Output preview:",
+                fenced_block(truncate_preview(body, preview_chars), language),
+            ]
+        )
     else:
         lines.extend(["", fenced_block(body, language)])
     return "\n".join(lines)
@@ -582,20 +588,18 @@ def is_metadata_record(record: dict[str, Any]) -> bool:
     return False
 
 
-def write_markdown_section(dst, title: str, body: str) -> None:
+def write_markdown_section(dst: TextIO, title: str, body: str) -> None:
     dst.write(f"# {title}:\n\n")
     dst.write(body.rstrip())
     dst.write("\n\n---\n\n")
 
 
-def convert_jsonl_to_markdown(
-    input_path: Path, output_path: Path, options: MarkdownOptions
-) -> int:
+def convert_jsonl_to_markdown(input_path: Path, output_path: Path, options: MarkdownOptions) -> int:
     count = 0
     seen_dialogue: set[tuple[str, str]] = set()
     tool_names_by_call_id: dict[str, str] = {}
 
-    def write_dialogue(dst, title: str, body: str) -> None:
+    def write_dialogue(dst: TextIO, title: str, body: str) -> None:
         nonlocal count
         normalized_body = body.strip()
         if not normalized_body:
@@ -607,7 +611,7 @@ def convert_jsonl_to_markdown(
         write_markdown_section(dst, title, normalized_body)
         count += 1
 
-    def write_section(dst, title: str, body: str) -> None:
+    def write_section(dst: TextIO, title: str, body: str) -> None:
         nonlocal count
         normalized_body = body.strip()
         if not normalized_body:

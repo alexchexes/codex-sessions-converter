@@ -3,7 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -17,7 +17,7 @@ from codex_sessions_converter.converter import (  # noqa: E402
 )
 
 
-def write_jsonl(path: Path, records: list[dict]) -> None:
+def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     path.write_text(
         "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n",
         encoding="utf-8",
@@ -47,7 +47,7 @@ class ConverterTests(unittest.TestCase):
 
             self.assertEqual(count, 1)
             output = output_path.read_text(encoding="utf-8")
-            self.assertIn("encrypted_content: \"...\"", output)
+            self.assertIn('encrypted_content: "..."', output)
             self.assertNotIn("secret", output)
 
     def test_markdown_names_mode_omits_tool_payloads(self) -> None:
@@ -72,7 +72,7 @@ class ConverterTests(unittest.TestCase):
                         "payload": {
                             "type": "function_call",
                             "name": "shell_command",
-                            "arguments": "{\"command\":\"echo hello\"}",
+                            "arguments": '{"command":"echo hello"}',
                             "call_id": "call_1",
                         },
                     },

@@ -19,10 +19,23 @@ It turns files from a Codex home directory such as
 
 ## Install
 
-From a local checkout:
+Install the latest version from GitHub:
 
 ```bash
-pip install .
+pipx install git+https://github.com/alexchexes/codex-sessions-converter.git
+```
+
+Or install from a local checkout:
+
+```bash
+pipx install .
+```
+
+If `pipx` is not installed yet, install it first:
+
+```bash
+python -m pip install --user pipx
+python -m pipx ensurepath
 ```
 
 Or run it from a checkout without installing:
@@ -109,9 +122,19 @@ MIT
 
 ## Development
 
-Install development tools:
+Create a local virtual environment and install development tools:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+In PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 ```
 

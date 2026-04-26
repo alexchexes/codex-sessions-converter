@@ -1,6 +1,6 @@
-# codex-sessions-converter
+# Codex sessions converter
 
-Convert Codex session rollout JSONL files into readable Markdown or YAML.
+Convert Codex session rollout JSONL files into more readable Markdown or YAML.
 
 It turns files from a Codex home directory such as
 `~/.codex/sessions/YYYY/MM/DD/rollout-<...>.jsonl` into a more readable YAML, or a dialogue-oriented Markdown file:

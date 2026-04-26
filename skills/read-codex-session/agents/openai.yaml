@@ -1,0 +1,4 @@
+interface:
+  display_name: "Read Codex Session"
+  short_description: "Recover prior Codex context"
+  default_prompt: "Use $read-codex-session to recover context from an earlier Codex conversation."

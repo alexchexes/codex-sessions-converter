@@ -1,0 +1,60 @@
+---
+name: read-codex-session
+description: Read or recover context from previous Codex conversations or from the current conversation before context compaction. Use when asked to summarize, inspect, remember, or hand off context from an earlier or current Codex dialogue.
+---
+
+# Read Codex Session
+
+Use this skill to inspect Codex session history without loading raw rollout JSONL into context.
+
+## Workflow
+
+1. Resolve the target session:
+   - If the user gives a rollout path, use it directly.
+   - If the user gives a session id, rollout id fragment, or thread name, resolve it under `$CODEX_HOME/sessions` or `~/.codex/sessions`.
+   - If the user says "latest" or does not specify a session, use the newest `rollout-*.jsonl`.
+
+2. Prepare compact Markdown with the bundled helper:
+
+```bash
+python ~/.codex/skills/read-codex-session/scripts/prepare_session_markdown.py <target>
+```
+
+On Windows PowerShell:
+
+```powershell
+python $env:USERPROFILE\.codex\skills\read-codex-session\scripts\prepare_session_markdown.py <target>
+```
+
+The helper writes Markdown under `$CODEX_HOME/tmp/sessions/...` and prints the path.
+
+3. Read the generated Markdown, not the raw JSONL. Prefer targeted reads with `rg`, `Select-String`, `Get-Content -TotalCount`, or equivalent before loading a large file.
+
+4. Summarize only the session facts needed for the user request. Mention when tool outputs were omitted or previewed.
+
+## Detail Levels
+
+Default helper output uses `--md-tools names`: visible dialogue plus tool names and call ids.
+
+Use a higher-detail pass only when needed:
+
+```bash
+python ~/.codex/skills/read-codex-session/scripts/prepare_session_markdown.py <target> --md-tools preview --preview-chars 1200
+python ~/.codex/skills/read-codex-session/scripts/prepare_session_markdown.py <target> --md-tools full
+python ~/.codex/skills/read-codex-session/scripts/prepare_session_markdown.py <target> --md-include metadata
+```
+
+Use `--md-include metadata` when turn context, token counts, cwd, model, or rate-limit information matters.
+
+Use `--format yaml` or the converter CLI directly only when the user asks for raw structured inspection.
+
+## Manual Fallback
+
+If the helper is unavailable, run `codex-sessions-converter` directly:
+
+```bash
+codex-sessions-converter --md-tools names <rollout.jsonl> <output.md>
+codex-sessions-converter --md-tools preview --md-tool-preview-chars 1200 <rollout.jsonl> <output.md>
+```
+
+Avoid opening raw JSONL except for narrow targeted searches such as finding a missing record type.

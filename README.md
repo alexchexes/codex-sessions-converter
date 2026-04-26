@@ -71,6 +71,28 @@ Use Markdown explicitly when no `.md` output path is supplied:
 codex-sessions-converter --format md sessions/YYYY/MM/DD/rollout.jsonl
 ```
 
+## Codex Skill
+
+This repo also includes a Codex skill that helps future Codex sessions inspect
+previous conversations without loading large raw session files directly.
+
+Install or update the skill from a local checkout:
+
+```bash
+mkdir -p ~/.codex/skills
+cp -r skills/read-codex-session ~/.codex/skills/
+```
+
+In PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force $env:USERPROFILE\.codex\skills
+Copy-Item -Recurse -Force .\skills\read-codex-session $env:USERPROFILE\.codex\skills\
+```
+
+After restarting Codex, ask for `$read-codex-session` or ask Codex to recover
+context from an earlier conversation.
+
 ## Markdown Detail
 
 `--md-include` controls broad optional sections:

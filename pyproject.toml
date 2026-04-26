@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codex-sessions-converter"
+version = "0.1.0"
+description = "Convert Codex session rollout JSONL files to readable Markdown or YAML."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Alex" }
+]
+keywords = ["codex", "jsonl", "markdown", "yaml", "sessions"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Documentation",
+  "Topic :: Text Processing :: Markup"
+]
+
+[project.scripts]
+codex-sessions-converter = "codex_sessions_converter.converter:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_sessions_converter"]

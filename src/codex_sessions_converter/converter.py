@@ -1,7 +1,9 @@
 import argparse
 import json
 import math
+import os
 import re
+import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +13,11 @@ __version__ = "0.1.0"
 
 
 SIMPLE_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+SESSION_ID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+NO_ROLLOUT_FILE = "NO ROLLOUT FILE"
+NO_SESSION_INDEX_ENTRY = "NO ENTRY IN session_index.jsonl"
 MARKDOWN_FEATURES = {"tools", "metadata", "raw"}
 MARKDOWN_TOOL_MODES = {"auto", "none", "names", "preview", "full"}
 DEFAULT_TOOL_PREVIEW_CHARS = 700
@@ -47,12 +54,60 @@ class MarkdownOptions:
     redaction: str
 
 
+@dataclass(frozen=True)
+class SessionIndexEntry:
+    session_id: str
+    thread_name: str
+
+
+@dataclass(frozen=True)
+class SessionFile:
+    path: Path
+    relative_path: str
+    session_id: str | None
+
+
+def default_codex_home() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".codex"
+
+
+def parse_list_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="codex-sessions-converter list",
+        description=(
+            "List Codex sessions and cross-check session_index.jsonl against rollout JSONL files."
+        ),
+    )
+    parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=default_codex_home(),
+        help="Codex home directory. Defaults to CODEX_HOME or ~/.codex.",
+    )
+    parser.add_argument(
+        "--session-index",
+        type=Path,
+        help="Path to session_index.jsonl. Defaults to <codex-home>/session_index.jsonl.",
+    )
+    parser.add_argument(
+        "--sessions-dir",
+        type=Path,
+        help="Path to Codex sessions directory. Defaults to <codex-home>/sessions.",
+    )
+    return parser.parse_args(argv)
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="codex-sessions-converter",
         description="Convert Codex session rollout JSONL files to YAML or Markdown.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
+            "Commands:\n"
+            "  list       list sessions and cross-check session_index.jsonl with rollout files\n\n"
             "Markdown include presets:\n"
             "  dialogue   visible user/Codex messages, reasoning, progress messages\n"
             "  default    dialogue plus tool calls and tool outputs\n"
@@ -165,6 +220,135 @@ def iter_jsonl_objects(input_path: Path) -> Iterable[tuple[int, dict[str, Any]]]
                     f"Invalid JSON on line {line_number} of {input_path}: {exc}"
                 ) from exc
             yield line_number, obj
+
+
+def iter_concatenated_json_objects(input_path: Path) -> Iterable[tuple[int, Any]]:
+    decoder = json.JSONDecoder()
+    with input_path.open("r", encoding="utf-8") as src:
+        for line_number, raw_line in enumerate(src, start=1):
+            remaining = raw_line.strip()
+            while remaining:
+                try:
+                    obj, end = decoder.raw_decode(remaining)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Invalid JSON on line {line_number} of {input_path}: {exc}"
+                    ) from exc
+                yield line_number, obj
+                remaining = remaining[end:].lstrip()
+
+
+def normalize_session_id(session_id: str) -> str:
+    return session_id.lower()
+
+
+def session_id_from_path(path: Path) -> str | None:
+    match = SESSION_ID_RE.search(path.stem)
+    if not match:
+        return None
+    return match.group(0)
+
+
+def session_id_from_metadata(path: Path) -> str | None:
+    try:
+        for count, (_, record) in enumerate(iter_jsonl_objects(path), start=1):
+            payload = record.get("payload")
+            if record.get("type") == "session_meta" and isinstance(payload, dict):
+                session_id = payload.get("id")
+                if isinstance(session_id, str) and session_id:
+                    return session_id
+            if count >= 20:
+                break
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def read_session_index(index_path: Path) -> list[SessionIndexEntry]:
+    if not index_path.exists():
+        return []
+
+    entries = []
+    for _, record in iter_concatenated_json_objects(index_path):
+        if not isinstance(record, dict):
+            continue
+        session_id = record.get("id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        thread_name = record.get("thread_name")
+        entries.append(
+            SessionIndexEntry(
+                session_id=session_id,
+                thread_name=thread_name if isinstance(thread_name, str) else "",
+            )
+        )
+    return entries
+
+
+def format_session_file_path(path: Path, sessions_dir: Path) -> str:
+    try:
+        relative_path = path.resolve().relative_to(sessions_dir.resolve())
+    except ValueError:
+        relative_path = path
+    return relative_path.as_posix()
+
+
+def discover_session_files(sessions_dir: Path) -> list[SessionFile]:
+    if not sessions_dir.exists():
+        return []
+
+    paths = sorted(candidate for candidate in sessions_dir.rglob("*.jsonl") if candidate.is_file())
+    session_files = []
+    for path in paths:
+        session_id = session_id_from_path(path) or session_id_from_metadata(path)
+        session_files.append(
+            SessionFile(
+                path=path,
+                relative_path=format_session_file_path(path, sessions_dir),
+                session_id=session_id,
+            )
+        )
+    return session_files
+
+
+def list_session_lines(
+    codex_home: Path,
+    session_index_path: Path | None = None,
+    sessions_dir: Path | None = None,
+) -> list[str]:
+    index_path = session_index_path or codex_home / "session_index.jsonl"
+    resolved_sessions_dir = sessions_dir or codex_home / "sessions"
+
+    index_entries = read_session_index(index_path)
+    session_files = discover_session_files(resolved_sessions_dir)
+    session_files_by_id: dict[str, list[SessionFile]] = {}
+    for session_file in session_files:
+        if session_file.session_id:
+            normalized_id = normalize_session_id(session_file.session_id)
+            session_files_by_id.setdefault(normalized_id, []).append(session_file)
+
+    indexed_ids = {normalize_session_id(entry.session_id) for entry in index_entries}
+    lines = []
+    for entry in index_entries:
+        matching_files = session_files_by_id.get(normalize_session_id(entry.session_id), [])
+        if not matching_files:
+            lines.append(f"{entry.session_id} - {entry.thread_name} - {NO_ROLLOUT_FILE}")
+            continue
+        for session_file in matching_files:
+            lines.append(f"{entry.session_id} - {entry.thread_name} - {session_file.relative_path}")
+
+    for session_file in session_files:
+        if session_file.session_id and normalize_session_id(session_file.session_id) in indexed_ids:
+            continue
+        lines.append(f"{session_file.relative_path} - {NO_SESSION_INDEX_ENTRY}")
+
+    return lines
+
+
+def encode_for_output(text: str, encoding: str | None) -> str:
+    if not encoding:
+        return text
+    return text.encode(encoding, errors="backslashreplace").decode(encoding)
 
 
 def render_key(key: str) -> str:
@@ -683,8 +867,37 @@ def convert_jsonl_to_markdown(input_path: Path, output_path: Path, options: Mark
     return count
 
 
+def run_list_command(args: argparse.Namespace) -> int:
+    codex_home = args.codex_home.expanduser().resolve()
+    session_index_path = (
+        args.session_index.expanduser().resolve()
+        if args.session_index
+        else codex_home / "session_index.jsonl"
+    )
+    sessions_dir = (
+        args.sessions_dir.expanduser().resolve() if args.sessions_dir else codex_home / "sessions"
+    )
+
+    try:
+        lines = list_session_lines(
+            codex_home=codex_home,
+            session_index_path=session_index_path,
+            sessions_dir=sessions_dir,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    for line in lines:
+        print(encode_for_output(line, sys.stdout.encoding))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv[:1] == ["list"]:
+        return run_list_command(parse_list_args(raw_argv[1:]))
+
+    args = parse_args(raw_argv)
     try:
         markdown_features = parse_markdown_include(args.md_include)
     except ValueError as exc:

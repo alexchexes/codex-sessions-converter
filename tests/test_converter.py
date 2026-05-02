@@ -2,6 +2,8 @@ import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,9 @@ from codex_sessions_converter.converter import (  # noqa: E402
     MarkdownOptions,
     convert_jsonl_to_markdown,
     convert_jsonl_to_yaml_stream,
+    encode_for_output,
+    list_session_lines,
+    main,
     parse_markdown_include,
     resolve_markdown_tool_mode,
 )
@@ -181,6 +186,117 @@ class ConverterTests(unittest.TestCase):
     def test_include_modifiers(self) -> None:
         self.assertEqual(parse_markdown_include("default,-tools"), set())
         self.assertEqual(parse_markdown_include("dialogue,+metadata"), {"metadata"})
+
+    def test_list_sessions_cross_checks_index_and_session_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            matched_id = "019c8599-6845-7772-9c64-5f0ee47c73f1"
+            missing_file_id = "11111111-1111-1111-1111-111111111111"
+            orphan_id = "22222222-2222-2222-2222-222222222222"
+            write_jsonl(
+                codex_home / "session_index.jsonl",
+                [
+                    {"id": matched_id, "thread_name": "Add scope for type casting types"},
+                    {"id": missing_file_id, "thread_name": "Missing rollout"},
+                ],
+            )
+            matched_path = sessions_day / f"rollout-2026-04-30T18-20-39-{matched_id}.jsonl"
+            matched_path.write_text("", encoding="utf-8")
+            orphan_path = sessions_day / f"rollout-2026-04-30T18-21-40-{orphan_id}.jsonl"
+            orphan_path.write_text("", encoding="utf-8")
+
+            lines = list_session_lines(codex_home)
+
+            self.assertEqual(
+                lines,
+                [
+                    (
+                        f"{matched_id} - Add scope for type casting types - "
+                        f"2026/04/30/{matched_path.name}"
+                    ),
+                    f"{missing_file_id} - Missing rollout - NO ROLLOUT FILE",
+                    f"2026/04/30/{orphan_path.name} - NO ENTRY IN session_index.jsonl",
+                ],
+            )
+
+    def test_list_sessions_reads_session_id_from_metadata_when_filename_has_no_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "33333333-3333-3333-3333-333333333333"
+            write_jsonl(
+                codex_home / "session_index.jsonl",
+                [{"id": session_id, "thread_name": "Metadata id"}],
+            )
+            session_path = sessions_day / "rollout.jsonl"
+            write_jsonl(
+                session_path,
+                [{"type": "session_meta", "payload": {"id": session_id}}],
+            )
+
+            lines = list_session_lines(codex_home)
+
+            self.assertEqual(
+                lines,
+                [f"{session_id} - Metadata id - 2026/04/30/rollout.jsonl"],
+            )
+
+    def test_list_sessions_accepts_concatenated_index_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            codex_home.joinpath("sessions").mkdir()
+
+            first_id = "55555555-5555-5555-5555-555555555555"
+            second_id = "66666666-6666-6666-6666-666666666666"
+            records = [
+                {"id": first_id, "thread_name": "First"},
+                {"id": second_id, "thread_name": "Second"},
+            ]
+            codex_home.joinpath("session_index.jsonl").write_text(
+                "".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+
+            lines = list_session_lines(codex_home)
+
+            self.assertEqual(
+                lines,
+                [
+                    f"{first_id} - First - NO ROLLOUT FILE",
+                    f"{second_id} - Second - NO ROLLOUT FILE",
+                ],
+            )
+
+    def test_list_command_prints_session_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "44444444-4444-4444-4444-444444444444"
+            write_jsonl(
+                codex_home / "session_index.jsonl",
+                [{"id": session_id, "thread_name": "CLI list"}],
+            )
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(["list", "--codex-home", str(codex_home)])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                buffer.getvalue().splitlines(),
+                [f"{session_id} - CLI list - NO ROLLOUT FILE"],
+            )
+
+    def test_encode_for_output_escapes_characters_unsupported_by_encoding(self) -> None:
+        self.assertEqual(encode_for_output("Thread ✓", "cp1252"), r"Thread \u2713")
+        self.assertEqual(encode_for_output("Thread ✓", "utf-8"), "Thread ✓")
 
 
 if __name__ == "__main__":

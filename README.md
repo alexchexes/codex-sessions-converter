@@ -71,6 +71,27 @@ Use Markdown explicitly when no `.md` output path is supplied:
 codex-sessions-converter --format md sessions/YYYY/MM/DD/rollout.jsonl
 ```
 
+List Codex sessions from `CODEX_HOME` or `~/.codex` and cross-check
+`session_index.jsonl` against actual session files:
+
+```bash
+codex-sessions-converter list
+```
+
+Example output:
+
+```text
+019c8599-6845-7772-9c64-5f0ee47c73f1 - Add scope for type casting types - YYYY/MM/DD/rollout-....jsonl
+019c8599-6845-7772-9c64-5f0ee47c73f1 - Add scope for type casting types - NO ROLLOUT FILE
+YYYY/MM/DD/rollout-....jsonl - NO ENTRY IN session_index.jsonl
+```
+
+Use a specific Codex home directory:
+
+```bash
+codex-sessions-converter list --codex-home ~/.codex
+```
+
 ## Codex Skill
 
 This repo also includes a Codex skill that helps future Codex sessions inspect

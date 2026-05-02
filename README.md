@@ -59,6 +59,12 @@ Convert to YAML:
 codex-sessions-converter sessions/YYYY/MM/DD/rollout.jsonl rollout.yaml
 ```
 
+Use YAML explicitly:
+
+```bash
+codex-sessions-converter --yaml sessions/YYYY/MM/DD/rollout.jsonl
+```
+
 Convert to Markdown:
 
 ```bash
@@ -68,7 +74,32 @@ codex-sessions-converter sessions/YYYY/MM/DD/rollout.jsonl rollout.md
 Use Markdown explicitly when no `.md` output path is supplied:
 
 ```bash
-codex-sessions-converter --format md sessions/YYYY/MM/DD/rollout.jsonl
+codex-sessions-converter --md sessions/YYYY/MM/DD/rollout.jsonl
+```
+
+The longer `--format md` form is also supported.
+
+When no output path is supplied, the converter writes under the Codex home
+directory, not the current directory. Codex home defaults to `CODEX_HOME` or
+`~/.codex`, so a session rollout normally writes to a path like
+`~/.codex/tmp/sessions/YYYY/MM/DD/rollout-<...>.yaml`.
+
+Convert by session ID:
+
+```bash
+codex-sessions-converter 019dd5ce-19e1-78c3-9313-325228ddd983
+```
+
+Write an ID conversion to the current directory:
+
+```bash
+codex-sessions-converter 019dd5ce-19e1-78c3-9313-325228ddd983 ./
+```
+
+Use a specific Codex home directory for session ID lookup and default output:
+
+```bash
+codex-sessions-converter --codex-home ~/.codex 019dd5ce-19e1-78c3-9313-325228ddd983
 ```
 
 List Codex sessions from `CODEX_HOME` or `~/.codex` and cross-check
@@ -81,7 +112,7 @@ codex-sessions-converter list
 Example output:
 
 ```text
-019c8599-6845-7772-9c64-5f0ee47c73f1 - Add scope for type casting types - YYYY/MM/DD/rollout-....jsonl
+2026-02-22 13:48 - 2026-02-22 13:50 (UTC+00:00) - 019c8599-6845-7772-9c64-5f0ee47c73f1 - Add scope for type casting types
 019c8599-6845-7772-9c64-5f0ee47c73f1 - Add scope for type casting types - NO ROLLOUT FILE
 YYYY/MM/DD/rollout-....jsonl - NO ENTRY IN session_index.jsonl
 ```
@@ -122,7 +153,7 @@ context from an earlier conversation.
 # Visible user/Codex messages, reasoning, and progress messages.
 codex-sessions-converter --md-include dialogue input.jsonl output.md
 
-# Default: dialogue plus full tool calls and outputs.
+# Default: dialogue plus concise tool call previews.
 codex-sessions-converter --md-include default input.jsonl output.md
 
 # Add metadata tables such as turn_context and token_count.
@@ -138,6 +169,9 @@ codex-sessions-converter --md-include full input.jsonl output.md
 # Tool names and call IDs only.
 codex-sessions-converter --md-tools names input.jsonl output.md
 
+# Useful previews for known tool calls; unknown tools fall back to names.
+codex-sessions-converter --md-tools smart input.jsonl output.md
+
 # Tool names plus truncated arguments and outputs.
 codex-sessions-converter --md-tools preview input.jsonl output.md
 
@@ -149,12 +183,14 @@ codex-sessions-converter --md-tools none input.jsonl output.md
 ```
 
 The default `--md-tools auto` follows `--md-include`: presets that include tools
-render full tool details, and presets without tools omit them. Explicit
-`--md-tools` values override that behavior.
+render smart tool call previews, and presets without tools omit them. Explicit
+`--md-tools` values override that behavior. Smart mode keeps tool outputs to
+names and call IDs.
 
 ## Notes
 
-- Encrypted reasoning payloads are redacted by default as `...`.
+- Encrypted reasoning payloads are redacted by default as `...` and rendered
+  compactly in Markdown.
 - Markdown metadata tables escape pipe characters and replace embedded newlines
   with `<br>`.
 - The converter uses only the Python standard library.

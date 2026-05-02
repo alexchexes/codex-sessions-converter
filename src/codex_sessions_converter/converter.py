@@ -6,6 +6,7 @@ import re
 import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -19,7 +20,7 @@ SESSION_ID_RE = re.compile(
 NO_ROLLOUT_FILE = "NO ROLLOUT FILE"
 NO_SESSION_INDEX_ENTRY = "NO ENTRY IN session_index.jsonl"
 MARKDOWN_FEATURES = {"tools", "metadata", "raw"}
-MARKDOWN_TOOL_MODES = {"auto", "none", "names", "preview", "full"}
+MARKDOWN_TOOL_MODES = {"auto", "none", "names", "smart", "preview", "full"}
 DEFAULT_TOOL_PREVIEW_CHARS = 700
 MARKDOWN_PRESETS = {
     "dialogue": set(),
@@ -58,6 +59,7 @@ class MarkdownOptions:
 class SessionIndexEntry:
     session_id: str
     thread_name: str
+    updated_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,18 @@ class SessionFile:
     path: Path
     relative_path: str
     session_id: str | None
+    started_at: datetime | None
+    ended_at: datetime | None
+
+
+@dataclass(frozen=True)
+class ConversionInput:
+    path: Path
+    output_stem: str | None
+
+
+class CliError(Exception):
+    pass
 
 
 def default_codex_home() -> Path:
@@ -114,9 +128,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "  metadata   default plus metadata tables such as turn_context/token_count\n"
             "  full       metadata plus raw blocks for unhandled records\n\n"
             "Markdown tool detail modes:\n"
-            "  auto       full when tools are included by --md-include, otherwise none\n"
+            "  auto       smart when tools are included by --md-include, otherwise none\n"
             "  none       omit tool call/output sections\n"
             "  names      show only tool names and call IDs\n"
+            "  smart      show useful previews for known tool calls, otherwise names\n"
             "  preview    show names plus truncated arguments/outputs\n"
             "  full       show full arguments/outputs\n\n"
             "The --md-include value can also use modifiers, for example:\n"
@@ -131,15 +146,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "output",
         nargs="?",
         type=Path,
-        help=(
-            "Path to the output file. Defaults to replacing .jsonl with .yaml, "
-            "or .md when Markdown output is selected."
-        ),
+        help=("Path to the output file or directory. Defaults under <codex-home>/tmp."),
     )
     parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=default_codex_home(),
+        help=(
+            "Codex home directory for session ID lookup and default output. "
+            "Defaults to CODEX_HOME or ~/.codex."
+        ),
+    )
+    format_group = parser.add_mutually_exclusive_group()
+    format_group.add_argument(
         "--format",
         choices=("yaml", "md", "markdown"),
         help="Output format. Defaults to Markdown for .md/.markdown output paths, otherwise YAML.",
+    )
+    format_group.add_argument(
+        "--md",
+        action="store_true",
+        help="Write Markdown output without specifying an .md output path.",
+    )
+    format_group.add_argument(
+        "--yaml",
+        action="store_true",
+        help="Write YAML output explicitly.",
     )
     parser.add_argument(
         "--md-include",
@@ -178,6 +210,10 @@ def normalize_output_format(output_format: str | None) -> str | None:
 
 
 def infer_output_format(args: argparse.Namespace) -> str:
+    if args.md:
+        return "md"
+    if args.yaml:
+        return "yaml"
     explicit_format = normalize_output_format(args.format)
     if explicit_format:
         return explicit_format
@@ -186,11 +222,43 @@ def infer_output_format(args: argparse.Namespace) -> str:
     return "yaml"
 
 
-def default_output_path(input_path: Path, output_format: str = "yaml") -> Path:
+def output_filename(input_path: Path, output_format: str = "yaml", stem: str | None = None) -> str:
     suffix = ".md" if output_format == "md" else ".yaml"
+    if stem:
+        return f"{stem}{suffix}"
     if input_path.suffix.lower() == ".jsonl":
-        return input_path.with_suffix(suffix)
-    return input_path.with_suffix(input_path.suffix + suffix)
+        return input_path.with_suffix(suffix).name
+    return input_path.with_suffix(input_path.suffix + suffix).name
+
+
+def default_output_path(
+    input_path: Path,
+    codex_home: Path,
+    output_format: str = "yaml",
+    stem: str | None = None,
+) -> Path:
+    output_name = output_filename(input_path, output_format, stem)
+    try:
+        relative_input = input_path.resolve().relative_to(codex_home.resolve())
+    except ValueError:
+        return codex_home / "tmp" / output_name
+    return (codex_home / "tmp" / relative_input).with_name(output_name)
+
+
+def resolve_output_path(
+    output_arg: Path | None,
+    input_path: Path,
+    codex_home: Path,
+    output_format: str,
+    stem: str | None = None,
+) -> Path:
+    if output_arg is None:
+        return default_output_path(input_path, codex_home, output_format, stem).resolve()
+
+    expanded_output = output_arg.expanduser()
+    if expanded_output.exists() and expanded_output.is_dir():
+        return (expanded_output / output_filename(input_path, output_format, stem)).resolve()
+    return expanded_output.resolve()
 
 
 def sanitize(value: Any, redaction: str) -> Any:
@@ -238,8 +306,52 @@ def iter_concatenated_json_objects(input_path: Path) -> Iterable[tuple[int, Any]
                 remaining = remaining[end:].lstrip()
 
 
+def parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+
+    fractional = re.search(r"\.(\d+)(?=[+-]\d\d:?\d\d$|$)", text)
+    if fractional and len(fractional.group(1)) > 6:
+        text = text[: fractional.start(1) + 6] + text[fractional.end(1) :]
+
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def format_local_timestamp(value: datetime | None) -> str:
+    if value is None:
+        return "UNKNOWN"
+    return value.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def local_timezone_offset_label(value: datetime | None) -> str:
+    converted = (value or datetime.now(timezone.utc)).astimezone()
+    offset = converted.utcoffset()
+    if offset is None:
+        return "UTC"
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    absolute_minutes = abs(total_minutes)
+    hours, minutes = divmod(absolute_minutes, 60)
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
 def normalize_session_id(session_id: str) -> str:
     return session_id.lower()
+
+
+def is_session_id(value: str) -> bool:
+    return SESSION_ID_RE.fullmatch(value) is not None
 
 
 def session_id_from_path(path: Path) -> str | None:
@@ -264,6 +376,42 @@ def session_id_from_metadata(path: Path) -> str | None:
     return None
 
 
+def session_file_metadata(
+    path: Path, *, include_ended_at: bool = False
+) -> tuple[str | None, datetime | None, datetime | None]:
+    session_id = session_id_from_path(path)
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    try:
+        for count, (_, record) in enumerate(iter_jsonl_objects(path), start=1):
+            record_timestamp = parse_timestamp(record.get("timestamp"))
+            if include_ended_at and record_timestamp is not None:
+                ended_at = record_timestamp
+
+            payload = record.get("payload")
+            if started_at is None:
+                started_at = record_timestamp
+                if started_at is None and isinstance(payload, dict):
+                    started_at = parse_timestamp(payload.get("timestamp"))
+            if (
+                session_id is None
+                and record.get("type") == "session_meta"
+                and isinstance(payload, dict)
+            ):
+                payload_id = payload.get("id")
+                if isinstance(payload_id, str) and payload_id:
+                    session_id = payload_id
+            if not include_ended_at and session_id is not None and started_at is not None:
+                break
+            if count >= 20:
+                if include_ended_at:
+                    continue
+                break
+    except (OSError, ValueError):
+        return session_id, started_at, ended_at
+    return session_id, started_at, ended_at
+
+
 def read_session_index(index_path: Path) -> list[SessionIndexEntry]:
     if not index_path.exists():
         return []
@@ -280,6 +428,7 @@ def read_session_index(index_path: Path) -> list[SessionIndexEntry]:
             SessionIndexEntry(
                 session_id=session_id,
                 thread_name=thread_name if isinstance(thread_name, str) else "",
+                updated_at=parse_timestamp(record.get("updated_at")),
             )
         )
     return entries
@@ -293,22 +442,67 @@ def format_session_file_path(path: Path, sessions_dir: Path) -> str:
     return relative_path.as_posix()
 
 
-def discover_session_files(sessions_dir: Path) -> list[SessionFile]:
+def discover_session_files(
+    sessions_dir: Path, *, include_ended_at: bool = False
+) -> list[SessionFile]:
     if not sessions_dir.exists():
         return []
 
     paths = sorted(candidate for candidate in sessions_dir.rglob("*.jsonl") if candidate.is_file())
     session_files = []
     for path in paths:
-        session_id = session_id_from_path(path) or session_id_from_metadata(path)
+        session_id, started_at, ended_at = session_file_metadata(
+            path, include_ended_at=include_ended_at
+        )
         session_files.append(
             SessionFile(
                 path=path,
                 relative_path=format_session_file_path(path, sessions_dir),
                 session_id=session_id,
+                started_at=started_at,
+                ended_at=ended_at,
             )
         )
     return session_files
+
+
+def resolve_session_id(session_id: str, codex_home: Path) -> Path:
+    sessions_dir = codex_home / "sessions"
+    normalized_id = normalize_session_id(session_id)
+    matches = [
+        session_file.path
+        for session_file in discover_session_files(sessions_dir)
+        if (
+            session_file.session_id
+            and normalize_session_id(session_file.session_id) == normalized_id
+        )
+    ]
+    if not matches:
+        raise CliError(f"No Codex session found for ID: {session_id}")
+    if len(matches) > 1:
+        rendered_matches = ", ".join(
+            format_session_file_path(path, sessions_dir) for path in matches
+        )
+        raise CliError(
+            f"Multiple Codex session files found for ID {session_id}: {rendered_matches}"
+        )
+    return matches[0].resolve()
+
+
+def resolve_conversion_input(raw_input: Path, codex_home: Path) -> ConversionInput:
+    input_text = str(raw_input)
+    if is_session_id(input_text):
+        return ConversionInput(
+            path=resolve_session_id(input_text, codex_home),
+            output_stem=normalize_session_id(input_text),
+        )
+
+    expanded_input = raw_input.expanduser()
+    if not expanded_input.exists():
+        raise CliError(f"Input file not found: {raw_input}")
+    if not expanded_input.is_file():
+        raise CliError(f"Input path is not a file: {raw_input}")
+    return ConversionInput(path=expanded_input.resolve(), output_stem=None)
 
 
 def list_session_lines(
@@ -320,7 +514,7 @@ def list_session_lines(
     resolved_sessions_dir = sessions_dir or codex_home / "sessions"
 
     index_entries = read_session_index(index_path)
-    session_files = discover_session_files(resolved_sessions_dir)
+    session_files = discover_session_files(resolved_sessions_dir, include_ended_at=True)
     session_files_by_id: dict[str, list[SessionFile]] = {}
     for session_file in session_files:
         if session_file.session_id:
@@ -334,8 +528,16 @@ def list_session_lines(
         if not matching_files:
             lines.append(f"{entry.session_id} - {entry.thread_name} - {NO_ROLLOUT_FILE}")
             continue
-        for session_file in matching_files:
-            lines.append(f"{entry.session_id} - {entry.thread_name} - {session_file.relative_path}")
+        session_file = matching_files[0]
+        timezone_label = local_timezone_offset_label(
+            session_file.ended_at or session_file.started_at
+        )
+        lines.append(
+            f"{format_local_timestamp(session_file.started_at)} - "
+            f"{format_local_timestamp(session_file.ended_at)} ({timezone_label}) - "
+            f"{entry.session_id} - "
+            f"{entry.thread_name}"
+        )
 
     for session_file in session_files:
         if session_file.session_id and normalize_session_id(session_file.session_id) in indexed_ids:
@@ -501,7 +703,7 @@ def parse_markdown_include(spec: str) -> set[str]:
 
 def resolve_markdown_tool_mode(markdown_features: set[str], requested_mode: str) -> str:
     if requested_mode == "auto":
-        return "full" if "tools" in markdown_features else "none"
+        return "smart" if "tools" in markdown_features else "none"
     return requested_mode
 
 
@@ -606,6 +808,30 @@ def parse_json_maybe(value: Any) -> tuple[str, str]:
     return render_json_block_content(value), "json"
 
 
+def parse_json_object_maybe(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def normalized_tool_short_name(full_name: str) -> str:
+    short_name = full_name.rsplit(".", 1)[-1]
+    for prefix in (
+        "mcp__playwright__",
+        "mcp__codex_apps__",
+        "mcp__ask_human_for_context__",
+    ):
+        if short_name.startswith(prefix):
+            return short_name[len(prefix) :]
+    return short_name
+
+
 def tool_display_name(payload: dict[str, Any]) -> str:
     call_type = payload.get("type", "tool_call")
     name = payload.get("name") or call_type
@@ -634,6 +860,262 @@ def render_preview_block(label: str, value: Any, max_chars: int) -> list[str]:
     return ["", label, fenced_block(truncate_preview(body, max_chars), language)]
 
 
+def append_inline_preview(lines: list[str], label: str, value: Any, max_chars: int) -> None:
+    if value is None:
+        return
+    text = str(value)
+    if not text:
+        return
+    lines.append(f"{label}: `{truncate_preview(text, max_chars)}`")
+
+
+def append_sequence_preview(
+    lines: list[str], label: str, value: Any, max_chars: int, max_items: int = 8
+) -> None:
+    if value is None:
+        return
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        append_inline_preview(lines, label, value, max_chars)
+        return
+
+    items = list(value)
+    rendered_items = []
+    for item in items[:max_items]:
+        if isinstance(item, (dict, list)):
+            rendered_items.append(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
+        else:
+            rendered_items.append(str(item))
+    if not rendered_items:
+        return
+    if len(items) > max_items:
+        rendered_items.append(f"... [{len(items) - max_items} more omitted]")
+    append_fenced_preview(lines, label, "\n".join(rendered_items), max_chars)
+
+
+def append_fenced_preview(
+    lines: list[str],
+    label: str,
+    value: Any,
+    max_chars: int,
+    language: str = "text",
+) -> None:
+    if value is None:
+        return
+    text = str(value)
+    if not text:
+        return
+    lines.extend(["", label, fenced_block(truncate_preview(text, max_chars), language)])
+
+
+def render_smart_tool_call_preview(
+    full_name: str, arguments: Any, preview_chars: int
+) -> list[str] | None:
+    short_name = normalized_tool_short_name(full_name)
+    lines: list[str] = []
+
+    if short_name == "apply_patch":
+        append_fenced_preview(lines, "Patch preview:", arguments, preview_chars, "diff")
+        return lines or None
+
+    args = parse_json_object_maybe(arguments)
+    if args is None:
+        return None
+
+    if short_name == "shell_command":
+        append_fenced_preview(lines, "Preview:", args.get("command"), preview_chars)
+        append_inline_preview(lines, "Workdir", args.get("workdir"), preview_chars)
+        append_inline_preview(lines, "Timeout ms", args.get("timeout_ms"), preview_chars)
+        return lines or None
+
+    if short_name in {"browser_run_code", "browser_evaluate"}:
+        label = "Code preview:" if short_name == "browser_run_code" else "Function preview:"
+        append_fenced_preview(
+            lines,
+            label,
+            args.get("code") or args.get("function"),
+            preview_chars,
+            "javascript",
+        )
+        append_inline_preview(lines, "Target", args.get("target"), preview_chars)
+        append_inline_preview(lines, "Filename", args.get("filename"), preview_chars)
+        return lines or None
+
+    if short_name == "update_plan":
+        explanation = args.get("explanation")
+        append_inline_preview(lines, "Explanation", explanation, preview_chars)
+        plan = args.get("plan")
+        if isinstance(plan, list):
+            preview_lines = []
+            for item in plan[:8]:
+                if not isinstance(item, dict):
+                    continue
+                status = item.get("status", "unknown")
+                step = item.get("step", "")
+                preview_lines.append(f"- {status}: {step}")
+            if len(plan) > 8:
+                preview_lines.append(f"... [{len(plan) - 8} more steps omitted]")
+            append_fenced_preview(lines, "Plan preview:", "\n".join(preview_lines), preview_chars)
+        return lines or None
+
+    if full_name == "tool_search_call":
+        append_inline_preview(lines, "Query", args.get("query"), preview_chars)
+        append_inline_preview(lines, "Limit", args.get("limit"), preview_chars)
+        return lines or None
+
+    if short_name in {
+        "request_user_input",
+        "asking_user_missing_context",
+    }:
+        questions = args.get("questions")
+        if isinstance(questions, list) and questions:
+            first_question = questions[0]
+            if isinstance(first_question, dict):
+                append_inline_preview(
+                    lines, "Question", first_question.get("question"), preview_chars
+                )
+        append_inline_preview(lines, "Question", args.get("question"), preview_chars)
+        append_inline_preview(lines, "Context", args.get("context"), preview_chars)
+        return lines or None
+
+    if short_name in {"spawn_agent", "send_input", "wait_agent", "close_agent", "resume_agent"}:
+        append_inline_preview(lines, "Target", args.get("target"), preview_chars)
+        append_inline_preview(lines, "ID", args.get("id"), preview_chars)
+        append_inline_preview(lines, "Agent type", args.get("agent_type"), preview_chars)
+        append_sequence_preview(lines, "Targets preview:", args.get("targets"), preview_chars)
+        append_fenced_preview(lines, "Message preview:", args.get("message"), preview_chars)
+        append_inline_preview(lines, "Timeout ms", args.get("timeout_ms"), preview_chars)
+        return lines or None
+
+    if short_name == "parallel":
+        tool_uses = args.get("tool_uses")
+        if isinstance(tool_uses, list):
+            preview_lines = []
+            for tool_use in tool_uses[:8]:
+                if not isinstance(tool_use, dict):
+                    continue
+                name = tool_use.get("recipient_name", "unknown")
+                parameters = tool_use.get("parameters")
+                if isinstance(parameters, dict):
+                    keys = ", ".join(parameters.keys())
+                    preview_lines.append(f"- {name} ({keys})" if keys else f"- {name}")
+                else:
+                    preview_lines.append(f"- {name}")
+            if len(tool_uses) > 8:
+                preview_lines.append(f"... [{len(tool_uses) - 8} more tool uses omitted]")
+            append_fenced_preview(
+                lines, "Tool uses preview:", "\n".join(preview_lines), preview_chars
+            )
+        return lines or None
+
+    if short_name in {
+        "browser_click",
+        "browser_close",
+        "browser_console_messages",
+        "browser_drag",
+        "browser_drop",
+        "browser_file_upload",
+        "browser_fill_form",
+        "browser_handle_dialog",
+        "browser_hover",
+        "browser_navigate",
+        "browser_navigate_back",
+        "browser_network_request",
+        "browser_network_requests",
+        "browser_press_key",
+        "browser_resize",
+        "browser_select_option",
+        "browser_snapshot",
+        "browser_tabs",
+        "browser_take_screenshot",
+        "browser_type",
+        "browser_wait_for",
+    }:
+        for key in (
+            "url",
+            "action",
+            "target",
+            "ref",
+            "element",
+            "button",
+            "key",
+            "text",
+            "textGone",
+            "filename",
+            "filter",
+            "part",
+            "index",
+            "time",
+            "width",
+            "height",
+            "fullPage",
+            "type",
+            "level",
+            "all",
+            "depth",
+            "boxes",
+            "accept",
+            "promptText",
+            "submit",
+            "slowly",
+            "static",
+        ):
+            append_inline_preview(
+                lines, key.replace("_", " ").title(), args.get(key), preview_chars
+            )
+        append_sequence_preview(lines, "Paths preview:", args.get("paths"), preview_chars)
+        append_sequence_preview(lines, "Values preview:", args.get("values"), preview_chars)
+        fields = args.get("fields")
+        if isinstance(fields, list):
+            field_lines = []
+            for field in fields[:8]:
+                if not isinstance(field, dict):
+                    continue
+                name = field.get("name", "field")
+                field_type = field.get("type")
+                target = field.get("target")
+                value = field.get("value")
+                details = [str(name)]
+                if field_type:
+                    details.append(f"type={field_type}")
+                if target:
+                    details.append(f"target={target}")
+                if value is not None:
+                    details.append(f"value={value}")
+                field_lines.append(" - ".join(details))
+            if len(fields) > 8:
+                field_lines.append(f"... [{len(fields) - 8} more fields omitted]")
+            append_fenced_preview(lines, "Fields preview:", "\n".join(field_lines), preview_chars)
+        return lines or None
+
+    if short_name == "view_image":
+        append_inline_preview(lines, "Path", args.get("path"), preview_chars)
+        append_sequence_preview(lines, "Paths preview:", args.get("paths"), preview_chars)
+        append_inline_preview(lines, "Detail", args.get("detail"), preview_chars)
+        return lines or None
+
+    if short_name in {"github_fetch", "github_search"}:
+        append_inline_preview(lines, "URL", args.get("url"), preview_chars)
+        append_inline_preview(lines, "Query", args.get("query"), preview_chars)
+        append_inline_preview(lines, "Repository name", args.get("repository_name"), preview_chars)
+        append_inline_preview(lines, "Top N", args.get("topn"), preview_chars)
+        return lines or None
+
+    if short_name in {"tool_suggest"}:
+        append_inline_preview(lines, "Tool ID", args.get("tool_id"), preview_chars)
+        append_inline_preview(lines, "Tool type", args.get("tool_type"), preview_chars)
+        append_inline_preview(lines, "Action type", args.get("action_type"), preview_chars)
+        append_inline_preview(lines, "Reason", args.get("suggest_reason"), preview_chars)
+        return lines or None
+
+    if short_name in {"list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"}:
+        append_inline_preview(lines, "Server", args.get("server"), preview_chars)
+        append_inline_preview(lines, "URI", args.get("uri"), preview_chars)
+        append_inline_preview(lines, "Cursor", args.get("cursor"), preview_chars)
+        return lines or None
+
+    return None
+
+
 def render_tool_call(
     payload: dict[str, Any], mode: str, preview_chars: int
 ) -> tuple[str, str | None]:
@@ -644,7 +1126,13 @@ def render_tool_call(
     if mode == "names":
         return "\n".join(lines), full_name
 
-    arguments = payload.get("arguments")
+    arguments = payload.get("arguments") if "arguments" in payload else payload.get("input")
+    if mode == "smart":
+        smart_preview = render_smart_tool_call_preview(full_name, arguments, preview_chars)
+        if smart_preview:
+            lines.extend(smart_preview)
+        return "\n".join(lines), full_name
+
     if arguments is not None:
         if mode == "preview":
             lines.extend(render_preview_block("Arguments preview:", arguments, preview_chars))
@@ -677,7 +1165,7 @@ def render_tool_output(
     lines = [f"**Tool output:** `{tool_name}`"]
     append_tool_identity(lines, payload)
 
-    if mode == "names":
+    if mode in {"names", "smart"}:
         return "\n".join(lines)
 
     if "output" in payload:
@@ -705,6 +1193,13 @@ def render_tool_output(
 
 
 def render_reasoning(payload: dict[str, Any], redaction: str) -> str:
+    if (
+        not payload.get("summary")
+        and not payload.get("content")
+        and payload.get("encrypted_content") is not None
+    ):
+        return f"**Reasoning (encrypted_content) {redaction}**"
+
     lines = ["**Reasoning**"]
 
     summary = payload.get("summary")
@@ -824,7 +1319,7 @@ def convert_jsonl_to_markdown(input_path: Path, output_path: Path, options: Mark
                 elif payload_type == "reasoning":
                     write_section(dst, "Codex", render_reasoning(payload, options.redaction))
                     handled = True
-                elif payload_type in {"function_call", "tool_search_call"}:
+                elif payload_type in {"function_call", "tool_search_call", "custom_tool_call"}:
                     if options.tool_mode != "none":
                         rendered_tool_call, tool_name = render_tool_call(
                             payload, options.tool_mode, options.tool_preview_chars
@@ -834,7 +1329,11 @@ def convert_jsonl_to_markdown(input_path: Path, output_path: Path, options: Mark
                             tool_names_by_call_id[call_id] = tool_name
                         write_section(dst, "Codex", rendered_tool_call)
                     handled = True
-                elif payload_type in {"function_call_output", "tool_search_output"}:
+                elif payload_type in {
+                    "function_call_output",
+                    "tool_search_output",
+                    "custom_tool_call_output",
+                }:
                     if options.tool_mode != "none":
                         write_section(
                             dst,
@@ -898,6 +1397,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_list_command(parse_list_args(raw_argv[1:]))
 
     args = parse_args(raw_argv)
+    codex_home = args.codex_home.expanduser().resolve()
     try:
         markdown_features = parse_markdown_include(args.md_include)
     except ValueError as exc:
@@ -906,31 +1406,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--md-tool-preview-chars must be greater than zero")
 
     output_format = infer_output_format(args)
-    input_path = args.input.resolve()
-    output_path = (args.output or default_output_path(input_path, output_format)).resolve()
+    try:
+        conversion_input = resolve_conversion_input(args.input, codex_home)
+    except CliError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    input_path = conversion_input.path
+    output_path = resolve_output_path(
+        args.output,
+        input_path,
+        codex_home,
+        output_format,
+        conversion_input.output_stem,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if output_format == "md":
         tool_mode = resolve_markdown_tool_mode(markdown_features, args.md_tools)
-        count = convert_jsonl_to_markdown(
-            input_path=input_path,
-            output_path=output_path,
-            options=MarkdownOptions(
-                tool_mode=tool_mode,
-                tool_preview_chars=args.md_tool_preview_chars,
-                include_metadata="metadata" in markdown_features,
-                include_raw="raw" in markdown_features,
-                redaction=args.redact_encrypted,
-            ),
-        )
+        try:
+            count = convert_jsonl_to_markdown(
+                input_path=input_path,
+                output_path=output_path,
+                options=MarkdownOptions(
+                    tool_mode=tool_mode,
+                    tool_preview_chars=args.md_tool_preview_chars,
+                    include_metadata="metadata" in markdown_features,
+                    include_raw="raw" in markdown_features,
+                    redaction=args.redact_encrypted,
+                ),
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         print(f"Wrote {count} Markdown sections to {output_path}")
         return 0
 
-    count = convert_jsonl_to_yaml_stream(
-        input_path=input_path,
-        output_path=output_path,
-        redaction=args.redact_encrypted,
-    )
+    try:
+        count = convert_jsonl_to_yaml_stream(
+            input_path=input_path,
+            output_path=output_path,
+            redaction=args.redact_encrypted,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     print(f"Wrote {count} YAML documents to {output_path}")
     return 0
 

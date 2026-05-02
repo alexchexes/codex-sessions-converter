@@ -14,11 +14,17 @@ from codex_sessions_converter.converter import (  # noqa: E402
     MarkdownOptions,
     convert_jsonl_to_markdown,
     convert_jsonl_to_yaml_stream,
+    default_output_path,
     encode_for_output,
+    format_local_timestamp,
     list_session_lines,
+    local_timezone_offset_label,
     main,
     parse_markdown_include,
+    parse_timestamp,
+    render_reasoning,
     resolve_markdown_tool_mode,
+    resolve_output_path,
 )
 
 
@@ -148,6 +154,116 @@ class ConverterTests(unittest.TestCase):
             self.assertIn("Output preview:", output)
             self.assertIn("truncated", output)
 
+    def test_markdown_smart_mode_falls_back_to_names_for_unknown_tool_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "rollout.jsonl"
+            output_path = Path(tmpdir) / "rollout.md"
+            write_jsonl(
+                input_path,
+                [
+                    {
+                        "timestamp": "2026-04-26T00:00:01Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "future_tool",
+                            "arguments": '{"text":"do not render this"}',
+                            "call_id": "call_1",
+                        },
+                    }
+                ],
+            )
+
+            convert_jsonl_to_markdown(
+                input_path,
+                output_path,
+                MarkdownOptions(
+                    tool_mode="smart",
+                    tool_preview_chars=40,
+                    include_metadata=False,
+                    include_raw=False,
+                    redaction="...",
+                ),
+            )
+
+            output = output_path.read_text(encoding="utf-8")
+            self.assertIn("**Tool call:** `future_tool`", output)
+            self.assertIn("Call ID: `call_1`", output)
+            self.assertNotIn("do not render this", output)
+
+    def test_markdown_smart_mode_previews_apply_patch_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "rollout.jsonl"
+            output_path = Path(tmpdir) / "rollout.md"
+            write_jsonl(
+                input_path,
+                [
+                    {
+                        "timestamp": "2026-04-26T00:00:01Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call",
+                            "name": "apply_patch",
+                            "input": "*** Begin Patch\n*** Update File: x\n+hello\n*** End Patch",
+                            "call_id": "call_1",
+                        },
+                    }
+                ],
+            )
+
+            convert_jsonl_to_markdown(
+                input_path,
+                output_path,
+                MarkdownOptions(
+                    tool_mode="smart",
+                    tool_preview_chars=80,
+                    include_metadata=False,
+                    include_raw=False,
+                    redaction="...",
+                ),
+            )
+
+            output = output_path.read_text(encoding="utf-8")
+            self.assertIn("**Tool call:** `apply_patch`", output)
+            self.assertIn("Patch preview:", output)
+            self.assertIn("*** Begin Patch", output)
+
+    def test_markdown_smart_mode_previews_legacy_mcp_tool_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "rollout.jsonl"
+            output_path = Path(tmpdir) / "rollout.md"
+            write_jsonl(
+                input_path,
+                [
+                    {
+                        "timestamp": "2026-04-26T00:00:01Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "mcp__playwright__browser_navigate",
+                            "arguments": '{"url":"http://localhost:3000/"}',
+                            "call_id": "call_1",
+                        },
+                    }
+                ],
+            )
+
+            convert_jsonl_to_markdown(
+                input_path,
+                output_path,
+                MarkdownOptions(
+                    tool_mode="smart",
+                    tool_preview_chars=80,
+                    include_metadata=False,
+                    include_raw=False,
+                    redaction="...",
+                ),
+            )
+
+            output = output_path.read_text(encoding="utf-8")
+            self.assertIn("**Tool call:** `mcp__playwright__browser_navigate`", output)
+            self.assertIn("Url: `http://localhost:3000/`", output)
+
     def test_markdown_metadata_table_escapes_pipes_and_newlines(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_path = Path(tmpdir) / "rollout.jsonl"
@@ -179,13 +295,170 @@ class ConverterTests(unittest.TestCase):
             self.assertIn("a\\|b<br>c", output)
 
     def test_tool_mode_auto_follows_include_preset(self) -> None:
-        self.assertEqual(resolve_markdown_tool_mode({"tools"}, "auto"), "full")
+        self.assertEqual(resolve_markdown_tool_mode({"tools"}, "auto"), "smart")
         self.assertEqual(resolve_markdown_tool_mode(set(), "auto"), "none")
         self.assertEqual(resolve_markdown_tool_mode(set(), "names"), "names")
+
+    def test_encrypted_reasoning_renders_as_single_line(self) -> None:
+        self.assertEqual(
+            render_reasoning({"type": "reasoning", "encrypted_content": "secret"}, "..."),
+            "**Reasoning (encrypted_content) ...**",
+        )
 
     def test_include_modifiers(self) -> None:
         self.assertEqual(parse_markdown_include("default,-tools"), set())
         self.assertEqual(parse_markdown_include("dialogue,+metadata"), {"metadata"})
+
+    def test_default_output_path_goes_under_codex_tmp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir) / ".codex"
+            input_path = codex_home / "sessions" / "2026" / "04" / "30" / "rollout.jsonl"
+
+            output_path = default_output_path(input_path, codex_home, "yaml")
+
+            self.assertEqual(
+                output_path,
+                codex_home / "tmp" / "sessions" / "2026" / "04" / "30" / "rollout.yaml",
+            )
+
+    def test_directory_output_uses_default_output_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "out"
+            output_dir.mkdir()
+            input_path = Path(tmpdir) / "rollout.jsonl"
+            codex_home = Path(tmpdir) / ".codex"
+
+            output_path = resolve_output_path(output_dir, input_path, codex_home, "yaml", "abc")
+
+            self.assertEqual(output_path, output_dir / "abc.yaml")
+
+    def test_missing_input_exits_without_creating_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_input = Path(tmpdir) / "missing.jsonl"
+            output_path = Path(tmpdir) / "missing.yaml"
+
+            with self.assertRaises(SystemExit) as raised:
+                main([str(missing_input), str(output_path)])
+
+            self.assertEqual(str(raised.exception), f"Input file not found: {missing_input}")
+            self.assertFalse(output_path.exists())
+
+    def test_session_id_input_converts_default_output_under_codex_tmp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir) / ".codex"
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+            session_id = "019dd5ce-19e1-78c3-9313-325228ddd983"
+            input_path = sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl"
+            write_jsonl(input_path, [{"type": "session_meta", "payload": {"id": session_id}}])
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main([session_id, "--codex-home", str(codex_home)])
+
+            output_path = (
+                codex_home / "tmp" / "sessions" / "2026" / "04" / "30" / f"{session_id}.yaml"
+            )
+            self.assertEqual(result, 0)
+            self.assertTrue(output_path.exists())
+            self.assertIn(str(output_path), buffer.getvalue())
+
+    def test_session_id_input_can_write_to_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir) / ".codex"
+            output_dir = Path(tmpdir) / "out"
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+            output_dir.mkdir()
+            session_id = "019dd5ce-19e1-78c3-9313-325228ddd983"
+            input_path = sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl"
+            write_jsonl(input_path, [{"type": "session_meta", "payload": {"id": session_id}}])
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main([session_id, str(output_dir), "--codex-home", str(codex_home)])
+
+            output_path = output_dir / f"{session_id}.yaml"
+            self.assertEqual(result, 0)
+            self.assertTrue(output_path.exists())
+            self.assertIn(str(output_path), buffer.getvalue())
+
+    def test_md_flag_converts_to_markdown_without_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir) / ".codex"
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+            session_id = "019dd5ce-19e1-78c3-9313-325228ddd983"
+            input_path = sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl"
+            write_jsonl(
+                input_path,
+                [
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": "hello",
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "shell_command",
+                            "arguments": '{"command":"echo hello"}',
+                            "call_id": "call_1",
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": "call_1",
+                            "output": "very long output",
+                        },
+                    },
+                ],
+            )
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(["--md", session_id, "--codex-home", str(codex_home)])
+
+            output_path = (
+                codex_home / "tmp" / "sessions" / "2026" / "04" / "30" / f"{session_id}.md"
+            )
+            self.assertEqual(result, 0)
+            self.assertTrue(output_path.exists())
+            output = output_path.read_text(encoding="utf-8")
+            self.assertIn("# User:", output)
+            self.assertIn("**Tool call:** `shell_command`", output)
+            self.assertIn("Command preview:", output)
+            self.assertIn("echo hello", output)
+            self.assertIn("**Tool output:** `shell_command`", output)
+            self.assertNotIn("very long output", output)
+            self.assertIn(str(output_path), buffer.getvalue())
+
+    def test_yaml_flag_converts_to_yaml_without_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir) / ".codex"
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+            session_id = "019dd5ce-19e1-78c3-9313-325228ddd983"
+            input_path = sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl"
+            write_jsonl(input_path, [{"type": "session_meta", "payload": {"id": session_id}}])
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(["--yaml", session_id, "--codex-home", str(codex_home)])
+
+            output_path = (
+                codex_home / "tmp" / "sessions" / "2026" / "04" / "30" / f"{session_id}.yaml"
+            )
+            self.assertEqual(result, 0)
+            self.assertTrue(output_path.exists())
+            self.assertIn("session_meta", output_path.read_text(encoding="utf-8"))
+            self.assertIn(str(output_path), buffer.getvalue())
 
     def test_list_sessions_cross_checks_index_and_session_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -199,23 +472,46 @@ class ConverterTests(unittest.TestCase):
             write_jsonl(
                 codex_home / "session_index.jsonl",
                 [
-                    {"id": matched_id, "thread_name": "Add scope for type casting types"},
+                    {
+                        "id": matched_id,
+                        "thread_name": "Add scope for type casting types",
+                        "updated_at": "2026-03-06T13:24:38.0294272Z",
+                    },
                     {"id": missing_file_id, "thread_name": "Missing rollout"},
                 ],
             )
             matched_path = sessions_day / f"rollout-2026-04-30T18-20-39-{matched_id}.jsonl"
-            matched_path.write_text("", encoding="utf-8")
+            write_jsonl(
+                matched_path,
+                [
+                    {
+                        "timestamp": "2026-02-22T13:48:23.714Z",
+                        "type": "session_meta",
+                        "payload": {"id": matched_id},
+                    },
+                    {
+                        "timestamp": "2026-02-22T13:50:54.380Z",
+                        "type": "event_msg",
+                        "payload": {"type": "turn_aborted"},
+                    },
+                ],
+            )
             orphan_path = sessions_day / f"rollout-2026-04-30T18-21-40-{orphan_id}.jsonl"
             orphan_path.write_text("", encoding="utf-8")
 
             lines = list_session_lines(codex_home)
+            started_at = parse_timestamp("2026-02-22T13:48:23.714Z")
+            ended_at = parse_timestamp("2026-02-22T13:50:54.380Z")
 
             self.assertEqual(
                 lines,
                 [
                     (
-                        f"{matched_id} - Add scope for type casting types - "
-                        f"2026/04/30/{matched_path.name}"
+                        f"{format_local_timestamp(started_at)} - "
+                        f"{format_local_timestamp(ended_at)} "
+                        f"({local_timezone_offset_label(ended_at)}) - "
+                        f"{matched_id} - "
+                        "Add scope for type casting types"
                     ),
                     f"{missing_file_id} - Missing rollout - NO ROLLOUT FILE",
                     f"2026/04/30/{orphan_path.name} - NO ENTRY IN session_index.jsonl",
@@ -231,19 +527,45 @@ class ConverterTests(unittest.TestCase):
             session_id = "33333333-3333-3333-3333-333333333333"
             write_jsonl(
                 codex_home / "session_index.jsonl",
-                [{"id": session_id, "thread_name": "Metadata id"}],
+                [
+                    {
+                        "id": session_id,
+                        "thread_name": "Metadata id",
+                        "updated_at": "2026-04-30T19:01:00Z",
+                    }
+                ],
             )
             session_path = sessions_day / "rollout.jsonl"
             write_jsonl(
                 session_path,
-                [{"type": "session_meta", "payload": {"id": session_id}}],
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:00Z",
+                        "type": "session_meta",
+                        "payload": {"id": session_id},
+                    },
+                    {
+                        "timestamp": "2026-04-30T19:15:30Z",
+                        "type": "event_msg",
+                        "payload": {"type": "task_complete"},
+                    },
+                ],
             )
 
             lines = list_session_lines(codex_home)
+            started_at = parse_timestamp("2026-04-30T18:20:00Z")
+            ended_at = parse_timestamp("2026-04-30T19:15:30Z")
 
             self.assertEqual(
                 lines,
-                [f"{session_id} - Metadata id - 2026/04/30/rollout.jsonl"],
+                [
+                    (
+                        f"{format_local_timestamp(started_at)} - "
+                        f"{format_local_timestamp(ended_at)} "
+                        f"({local_timezone_offset_label(ended_at)}) - "
+                        f"{session_id} - Metadata id"
+                    )
+                ],
             )
 
     def test_list_sessions_accepts_concatenated_index_objects(self) -> None:

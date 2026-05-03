@@ -36,6 +36,8 @@ DEFAULT_TOOL_PREVIEW_CHARS = 700
 DATA_IMAGE_PREFIX_CHARS = 24
 MAX_MATCHES_BEFORE_LINE_OMISSION = 2
 MAX_VISIBLE_MATCHES_PER_OMITTED_LINE = 1
+MAX_INFERRED_TITLE_CHARS = 80
+MAX_INFERRED_TITLE_WORDS = 12
 DATA_IMAGE_URL_RE = re.compile(r"^data:(image/[A-Za-z0-9.+-]+);base64,(.*)$", re.DOTALL)
 IMAGE_EXTENSION_BY_MIME_TYPE = {
     "image/png": "png",
@@ -183,6 +185,16 @@ def parse_list_args(
         "--sessions-dir",
         type=Path,
         help="Path to Codex sessions directory. Defaults to <codex-home>/sessions.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Do not read or write the extracted session metadata cache.",
+    )
+    parser.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Ignore existing cached session metadata and rewrite cache entries.",
     )
     return parser.parse_args(argv)
 
@@ -689,14 +701,54 @@ def list_session_lines(
     codex_home: Path,
     session_index_path: Path | None = None,
     sessions_dir: Path | None = None,
+    *,
+    use_cache: bool = True,
+    rebuild_cache: bool = False,
 ) -> list[str]:
+    lines, _ = list_session_lines_with_warnings(
+        codex_home=codex_home,
+        session_index_path=session_index_path,
+        sessions_dir=sessions_dir,
+        use_cache=use_cache,
+        rebuild_cache=rebuild_cache,
+    )
+    return lines
+
+
+def list_session_lines_with_warnings(
+    codex_home: Path,
+    session_index_path: Path | None = None,
+    sessions_dir: Path | None = None,
+    *,
+    use_cache: bool = True,
+    rebuild_cache: bool = False,
+) -> tuple[list[str], list[str]]:
     index_path = session_index_path or codex_home / "session_index.jsonl"
     resolved_sessions_dir = sessions_dir or codex_home / "sessions"
 
     index_entries = read_session_index(index_path)
-    session_files = discover_session_files(resolved_sessions_dir, include_ended_at=True)
+    documents, warnings = load_search_documents(
+        codex_home=codex_home,
+        sessions_dir=resolved_sessions_dir,
+        redaction="...",
+        use_cache=use_cache,
+        rebuild_cache=rebuild_cache,
+    )
+    session_files_with_titles = [
+        (
+            SessionFile(
+                path=session_path,
+                relative_path=format_session_file_path(session_path, resolved_sessions_dir),
+                session_id=document.session_id,
+                started_at=document.started_at,
+                ended_at=document.ended_at,
+            ),
+            infer_search_document_title(document),
+        )
+        for session_path, document in documents
+    ]
     session_files_by_id: dict[str, list[SessionFile]] = {}
-    for session_file in session_files:
+    for session_file, _inferred_title in session_files_with_titles:
         if session_file.session_id:
             normalized_id = normalize_session_id(session_file.session_id)
             session_files_by_id.setdefault(normalized_id, []).append(session_file)
@@ -711,12 +763,12 @@ def list_session_lines(
         session_file = matching_files[0]
         lines.append(format_indexed_session_line(entry, session_file))
 
-    for session_file in session_files:
+    for session_file, inferred_title in session_files_with_titles:
         if session_file.session_id and normalize_session_id(session_file.session_id) in indexed_ids:
             continue
-        lines.append(f"{session_file.relative_path} - {NO_SESSION_INDEX_ENTRY}")
+        lines.append(format_unindexed_session_line(session_file, inferred_title))
 
-    return lines
+    return lines, warnings
 
 
 def format_indexed_session_line(entry: SessionIndexEntry, session_file: SessionFile) -> str:
@@ -725,6 +777,20 @@ def format_indexed_session_line(entry: SessionIndexEntry, session_file: SessionF
     if timestamp_text:
         parts.append(timestamp_text)
     parts.extend([entry.session_id, entry.thread_name])
+    return " - ".join(parts)
+
+
+def format_unindexed_session_line(session_file: SessionFile, inferred_title: str | None) -> str:
+    if not inferred_title:
+        return f"{session_file.relative_path} - {NO_SESSION_INDEX_ENTRY}"
+
+    parts = []
+    timestamp_text = format_session_timestamps(session_file)
+    if timestamp_text:
+        parts.append(timestamp_text)
+    parts.append(session_file.session_id or session_file.relative_path)
+    parts.append(inferred_title)
+    parts.append(NO_SESSION_INDEX_ENTRY)
     return " - ".join(parts)
 
 
@@ -750,13 +816,15 @@ def format_session_timestamps(session_file: SessionFile) -> str:
 
 
 def session_info_for_search(
-    session_file: SessionFile, entries_by_id: dict[str, SessionIndexEntry]
+    session_file: SessionFile,
+    entries_by_id: dict[str, SessionIndexEntry],
+    inferred_title: str | None = None,
 ) -> str:
     if session_file.session_id:
         entry = entries_by_id.get(normalize_session_id(session_file.session_id))
         if entry:
             return format_indexed_session_line(entry, session_file)
-    return f"{session_file.relative_path} - {NO_SESSION_INDEX_ENTRY}"
+    return format_unindexed_session_line(session_file, inferred_title)
 
 
 def parse_embedded_json(value: str) -> Any:
@@ -914,6 +982,52 @@ def render_labeled_search_lines(label: str, text: str) -> list[str]:
     if not normalized_text:
         return []
     return [f"{label}: {line.strip()}" for line in normalized_text.splitlines() if line.strip()]
+
+
+def infer_search_document_title(document: SearchDocument) -> str | None:
+    user_title = first_inferred_title_with_prefix(document.visible_lines, "User: ")
+    if user_title:
+        return user_title
+    return first_inferred_title_with_prefix(document.visible_lines, "Codex: ")
+
+
+def first_inferred_title_with_prefix(lines: Sequence[str], prefix: str) -> str | None:
+    for line in lines:
+        if not line.startswith(prefix):
+            continue
+        title = infer_title_from_message(line[len(prefix) :])
+        if title:
+            return title
+    return None
+
+
+def infer_title_from_message(text: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", text).strip(" \t\r\n#*-_`\"'")
+    if not normalized:
+        return None
+
+    sentence_match = re.search(r"(?<=[.!?])\s+", normalized)
+    if sentence_match:
+        sentence = normalized[: sentence_match.start() + 1].strip()
+        if 8 <= len(sentence) <= MAX_INFERRED_TITLE_CHARS:
+            return sentence
+
+    if len(normalized) <= MAX_INFERRED_TITLE_CHARS:
+        return normalized
+
+    words = normalized.split()
+    selected_words: list[str] = []
+    selected_length = 0
+    for word in words[:MAX_INFERRED_TITLE_WORDS]:
+        next_length = selected_length + len(word) + (1 if selected_words else 0)
+        if next_length > MAX_INFERRED_TITLE_CHARS:
+            break
+        selected_words.append(word)
+        selected_length = next_length
+
+    if selected_words:
+        return " ".join(selected_words)
+    return normalized[:MAX_INFERRED_TITLE_CHARS].rstrip()
 
 
 def render_session_metadata_search_lines(payload: dict[str, Any]) -> list[str]:
@@ -1306,6 +1420,59 @@ def search_document_for_file(
     return document, stat_result, True
 
 
+def discover_session_paths(sessions_dir: Path) -> list[Path]:
+    if not sessions_dir.exists():
+        return []
+    return sorted(candidate for candidate in sessions_dir.rglob("*.jsonl") if candidate.is_file())
+
+
+def load_search_documents(
+    codex_home: Path,
+    sessions_dir: Path,
+    redaction: str,
+    *,
+    use_cache: bool = True,
+    rebuild_cache: bool = False,
+) -> tuple[list[tuple[Path, SearchDocument]], list[str]]:
+    session_paths = discover_session_paths(sessions_dir)
+    cache_path = search_cache_path(codex_home)
+    cache_entries = read_search_cache(cache_path) if use_cache else None
+    cache_dirty = False
+    documents: list[tuple[Path, SearchDocument]] = []
+    warnings: list[str] = []
+
+    for session_path in session_paths:
+        try:
+            document, stat_result, document_rebuilt = search_document_for_file(
+                session_path,
+                redaction,
+                cache_entries,
+                rebuild_cache=rebuild_cache,
+            )
+            if cache_entries is not None and document_rebuilt:
+                cache_entries[search_cache_key(session_path)] = search_cache_entry(
+                    session_path, stat_result, document, redaction
+                )
+                cache_dirty = True
+            documents.append((session_path, document))
+        except (OSError, ValueError) as exc:
+            relative_path = format_session_file_path(session_path, sessions_dir)
+            warnings.append(f"{relative_path}: {exc}")
+            if cache_entries is not None:
+                cache_entries.pop(search_cache_key(session_path), None)
+                cache_dirty = True
+
+    if cache_entries is not None:
+        cache_dirty = prune_missing_search_cache_entries(cache_entries) or cache_dirty
+        if cache_dirty:
+            try:
+                write_search_cache(cache_path, cache_entries)
+            except OSError as exc:
+                warnings.append(f"Could not write search cache {cache_path}: {exc}")
+
+    return documents, warnings
+
+
 def search_sessions(
     codex_home: Path,
     options: SearchOptions,
@@ -1323,37 +1490,17 @@ def search_sessions(
     index_entries = read_session_index(index_path)
     entries_by_id = {normalize_session_id(entry.session_id): entry for entry in index_entries}
     search_pattern = compile_search_pattern(options)
-    session_paths = sorted(
-        candidate for candidate in resolved_sessions_dir.rglob("*.jsonl") if candidate.is_file()
+    documents, warnings = load_search_documents(
+        codex_home=codex_home,
+        sessions_dir=resolved_sessions_dir,
+        redaction=options.redaction,
+        use_cache=use_cache,
+        rebuild_cache=rebuild_cache,
     )
-    cache_path = search_cache_path(codex_home)
-    cache_entries = read_search_cache(cache_path) if use_cache else None
-    cache_dirty = False
 
     results = []
-    warnings = []
-    for session_path in session_paths:
-        try:
-            document, stat_result, document_rebuilt = search_document_for_file(
-                session_path,
-                options.redaction,
-                cache_entries,
-                rebuild_cache=rebuild_cache,
-            )
-            if cache_entries is not None and document_rebuilt:
-                cache_entries[search_cache_key(session_path)] = search_cache_entry(
-                    session_path, stat_result, document, options.redaction
-                )
-                cache_dirty = True
-            search_lines = search_document_lines(document, options)
-        except (OSError, ValueError) as exc:
-            relative_path = format_session_file_path(session_path, resolved_sessions_dir)
-            warnings.append(f"{relative_path}: {exc}")
-            if cache_entries is not None:
-                cache_entries.pop(search_cache_key(session_path), None)
-                cache_dirty = True
-            continue
-
+    for session_path, document in documents:
+        search_lines = search_document_lines(document, options)
         all_lines = search_matching_lines(search_lines, search_pattern, options.line_width)
         if options.max_lines_per_session:
             lines = all_lines[: options.max_lines_per_session]
@@ -1376,19 +1523,13 @@ def search_sessions(
             )
             results.append(
                 SearchResult(
-                    session_info=session_info_for_search(session_file, entries_by_id),
+                    session_info=session_info_for_search(
+                        session_file, entries_by_id, infer_search_document_title(document)
+                    ),
                     lines=lines,
                     omitted_occurrence_count=omitted_occurrence_count,
                 )
             )
-
-    if cache_entries is not None:
-        cache_dirty = prune_missing_search_cache_entries(cache_entries) or cache_dirty
-        if cache_dirty:
-            try:
-                write_search_cache(cache_path, cache_entries)
-            except OSError as exc:
-                warnings.append(f"Could not write search cache {cache_path}: {exc}")
 
     return results, warnings
 
@@ -1875,7 +2016,7 @@ def is_image_wrapper_text(text: str) -> bool:
 
 def is_injected_user_context(text: str) -> bool:
     stripped = text.lstrip()
-    return stripped.startswith("# AGENTS.md instructions")
+    return stripped.startswith(("# AGENTS.md instructions", "<environment_context>"))
 
 
 def render_json_block_content(value: Any) -> str:
@@ -2585,14 +2726,21 @@ def run_list_command(args: argparse.Namespace) -> int:
     )
 
     try:
-        lines = list_session_lines(
+        lines, warnings = list_session_lines_with_warnings(
             codex_home=codex_home,
             session_index_path=session_index_path,
             sessions_dir=sessions_dir,
+            use_cache=not args.no_cache,
+            rebuild_cache=args.rebuild_cache,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
+    for warning in warnings:
+        print(
+            encode_for_output(f"Warning: {warning}", sys.stderr.encoding),
+            file=sys.stderr,
+        )
     for line in lines:
         print(encode_for_output(line, sys.stdout.encoding))
     return 0

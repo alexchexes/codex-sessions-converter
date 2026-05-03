@@ -136,6 +136,10 @@ Example output:
 YYYY/MM/DD/rollout-....jsonl - NO ENTRY IN session_index.jsonl
 ```
 
+For rollout files missing from `session_index.jsonl`, `list` infers a display
+title from the first readable user/Codex message when possible, while still
+marking the missing index entry.
+
 Use a specific Codex home directory:
 
 ```bash
@@ -183,6 +187,7 @@ Search caches extracted searchable text under
 `~/.codex/cache/codex-sessions/search-v1.json` and invalidates entries when the
 source rollout file size or modification time changes. Use `--rebuild-cache` to
 refresh cached entries, or `--no-cache` for a one-off uncached search.
+`list` uses the same cache for rollout metadata and inferred titles.
 
 ## Codex Skill
 

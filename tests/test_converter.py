@@ -757,6 +757,115 @@ class ConverterTests(unittest.TestCase):
                 ],
             )
 
+    def test_list_sessions_infers_title_for_unindexed_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "12121212-1212-1212-1212-121212121212"
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": "Please add export support. Some extra detail follows.",
+                        },
+                    }
+                ],
+            )
+
+            lines = list_session_lines(codex_home)
+            started_at = parse_timestamp("2026-04-30T18:20:39Z")
+
+            self.assertEqual(
+                lines,
+                [
+                    (
+                        f"{format_local_timestamp(started_at)} - "
+                        f"{format_local_timestamp(started_at)} "
+                        f"({local_timezone_offset_label(started_at)}) - "
+                        f"{session_id} - Please add export support. - "
+                        "NO ENTRY IN session_index.jsonl"
+                    )
+                ],
+            )
+
+    def test_list_sessions_skips_injected_context_when_inferring_title(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "45454545-4545-4545-4545-454545454545"
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": "<environment_context>\n<cwd>D:\\repos</cwd>",
+                        },
+                    },
+                    {
+                        "timestamp": "2026-04-30T18:21:00Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": "Please sync this session to the Mac.",
+                        },
+                    },
+                ],
+            )
+
+            lines = list_session_lines(codex_home)
+
+            self.assertEqual(len(lines), 1)
+            self.assertIn("Please sync this session to the Mac.", lines[0])
+            self.assertNotIn("environment_context", lines[0])
+
+    def test_list_sessions_reuses_cached_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "23232323-2323-2323-2323-232323232323"
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": "Cached list title",
+                        },
+                    }
+                ],
+            )
+
+            first_lines = list_session_lines(codex_home)
+            self.assertTrue(search_cache_path(codex_home).exists())
+
+            with patch(
+                "codex_sessions_converter.converter.iter_jsonl_objects",
+                side_effect=AssertionError("list should reuse cached session metadata"),
+            ):
+                second_lines = list_session_lines(codex_home)
+
+            self.assertEqual(second_lines, first_lines)
+            self.assertIn("Cached list title", second_lines[0])
+
     def test_list_sessions_reads_session_id_from_metadata_when_filename_has_no_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             codex_home = Path(tmpdir)
@@ -897,6 +1006,37 @@ class ConverterTests(unittest.TestCase):
             self.assertNotIn("Then run it", output)
             self.assertNotIn("\\n", output)
             self.assertNotIn('\\"', output)
+
+    def test_find_infers_title_for_unindexed_rollout_header(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "34343434-3434-3434-3434-343434343434"
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": "Hand off this session to a Mac.",
+                        },
+                    }
+                ],
+            )
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(["find", "Mac", "--codex-home", str(codex_home)])
+
+            output = buffer.getvalue()
+            self.assertEqual(result, 0)
+            self.assertIn(f"{session_id} - Hand off this session to a Mac.", output)
+            self.assertIn("NO ENTRY IN session_index.jsonl", output)
 
     def test_find_searches_visible_messages_only_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

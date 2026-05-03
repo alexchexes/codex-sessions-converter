@@ -134,9 +134,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--md-tools",
-        choices=("auto", "none", "names", "preview", "full"),
-        default="names",
-        help="Markdown tool detail mode. Default: names.",
+        choices=("auto", "none", "names", "smart", "preview", "full"),
+        default="auto",
+        help="Markdown tool detail mode. Default: auto.",
+    )
+    parser.add_argument(
+        "--md-images",
+        choices=("truncate", "extract", "inline"),
+        default="truncate",
+        help="Markdown handling for base64 data images. Default: truncate.",
     )
     parser.add_argument(
         "--preview-chars",
@@ -171,6 +177,8 @@ def main() -> int:
         args.md_include,
         "--md-tools",
         args.md_tools,
+        "--md-images",
+        args.md_images,
         "--md-tool-preview-chars",
         str(args.preview_chars),
         str(input_path),

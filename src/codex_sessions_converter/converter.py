@@ -1,14 +1,22 @@
 import argparse
+import base64
+import binascii
+import errno
+import hashlib
 import json
 import math
 import os
 import re
 import sys
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
+from urllib.parse import quote
+
+from rich.console import Console
+from rich.text import Text
 
 __version__ = "0.1.0"
 
@@ -21,7 +29,21 @@ NO_ROLLOUT_FILE = "NO ROLLOUT FILE"
 NO_SESSION_INDEX_ENTRY = "NO ENTRY IN session_index.jsonl"
 MARKDOWN_FEATURES = {"tools", "metadata", "raw"}
 MARKDOWN_TOOL_MODES = {"auto", "none", "names", "smart", "preview", "full"}
+MARKDOWN_IMAGE_MODES = {"truncate", "extract", "inline"}
 DEFAULT_TOOL_PREVIEW_CHARS = 700
+DATA_IMAGE_PREFIX_CHARS = 24
+MAX_MATCHES_BEFORE_LINE_OMISSION = 2
+MAX_VISIBLE_MATCHES_PER_OMITTED_LINE = 1
+DATA_IMAGE_URL_RE = re.compile(r"^data:(image/[A-Za-z0-9.+-]+);base64,(.*)$", re.DOTALL)
+IMAGE_EXTENSION_BY_MIME_TYPE = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/bmp": "bmp",
+    "image/svg+xml": "svg",
+}
 MARKDOWN_PRESETS = {
     "dialogue": set(),
     "minimal": set(),
@@ -53,6 +75,7 @@ class MarkdownOptions:
     include_metadata: bool
     include_raw: bool
     redaction: str
+    image_mode: str = "truncate"
 
 
 @dataclass(frozen=True)
@@ -75,6 +98,33 @@ class SessionFile:
 class ConversionInput:
     path: Path
     output_stem: str | None
+
+
+@dataclass(frozen=True)
+class SearchOptions:
+    pattern: str
+    regex: bool
+    ignore_case: bool
+    line_width: int
+    max_lines_per_session: int
+    include_metadata: bool
+    include_tools: bool
+    color: str
+    redaction: str
+
+
+@dataclass(frozen=True)
+class SearchLine:
+    text: str
+    matches: tuple[tuple[int, int], ...]
+    occurrence_count: int
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    session_info: str
+    lines: tuple[SearchLine, ...]
+    omitted_occurrence_count: int
 
 
 class CliError(Exception):
@@ -114,6 +164,87 @@ def parse_list_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def parse_search_args(command: str, argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog=f"codex-sessions-converter {command}",
+        description="Search Codex session rollout JSONL files.",
+    )
+    parser.add_argument("pattern", help="Text or regex pattern to search for.")
+    parser.add_argument(
+        "-i",
+        "--ignore-case",
+        action="store_true",
+        help="Match case-insensitively.",
+    )
+    parser.add_argument(
+        "-r",
+        "-E",
+        "--regex",
+        action="store_true",
+        help="Treat the pattern as a Python regular expression.",
+    )
+    parser.add_argument(
+        "--line-width",
+        type=int,
+        default=160,
+        metavar="N",
+        help="Maximum visible characters per matching line. Default: %(default)s.",
+    )
+    parser.add_argument(
+        "-m",
+        "--max-lines-per-session",
+        type=int,
+        default=5,
+        metavar="N",
+        help=(
+            "Maximum matching lines to show per session. Use 0 for no limit. Default: %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Highlight matches with terminal colors. Default: auto.",
+    )
+    parser.add_argument(
+        "--metadata",
+        action="store_true",
+        help="Also search compact session metadata such as cwd, branch, and repository URL.",
+    )
+    parser.add_argument(
+        "--tools",
+        action="store_true",
+        help="Also search concise tool call previews such as shell commands.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Search visible messages, compact metadata, and concise tool call previews.",
+    )
+    parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=default_codex_home(),
+        help="Codex home directory. Defaults to CODEX_HOME or ~/.codex.",
+    )
+    parser.add_argument(
+        "--session-index",
+        type=Path,
+        help="Path to session_index.jsonl. Defaults to <codex-home>/session_index.jsonl.",
+    )
+    parser.add_argument(
+        "--sessions-dir",
+        type=Path,
+        help="Path to Codex sessions directory. Defaults to <codex-home>/sessions.",
+    )
+    parser.add_argument(
+        "--redact-encrypted",
+        default="...",
+        help="Replacement text for any encrypted_content field.",
+    )
+    return parser.parse_args(argv)
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="codex-sessions-converter",
@@ -122,6 +253,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         epilog=(
             "Commands:\n"
             "  list       list sessions and cross-check session_index.jsonl with rollout files\n\n"
+            "  find       search sessions under Codex home\n"
+            "  grep       alias for find\n\n"
             "Markdown include presets:\n"
             "  dialogue   visible user/Codex messages, reasoning, progress messages\n"
             "  default    dialogue plus tool calls and tool outputs\n"
@@ -134,6 +267,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "  smart      show useful previews for known tool calls, otherwise names\n"
             "  preview    show names plus truncated arguments/outputs\n"
             "  full       show full arguments/outputs\n\n"
+            "Markdown image modes:\n"
+            "  truncate   replace base64 data images with compact placeholders\n"
+            "  extract    write base64 data images next to the Markdown and link them\n"
+            "  inline     keep base64 data images inline\n\n"
             "The --md-include value can also use modifiers, for example:\n"
             "  default,-tools\n"
             "  dialogue,+metadata\n"
@@ -194,6 +331,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "Maximum characters per tool argument/output preview when "
             "--md-tools=preview. Default: %(default)s."
         ),
+    )
+    parser.add_argument(
+        "--md-images",
+        choices=tuple(sorted(MARKDOWN_IMAGE_MODES)),
+        default="truncate",
+        help="Markdown handling for base64 data images. Default: %(default)s.",
     )
     parser.add_argument(
         "--redact-encrypted",
@@ -529,15 +672,7 @@ def list_session_lines(
             lines.append(f"{entry.session_id} - {entry.thread_name} - {NO_ROLLOUT_FILE}")
             continue
         session_file = matching_files[0]
-        timezone_label = local_timezone_offset_label(
-            session_file.ended_at or session_file.started_at
-        )
-        lines.append(
-            f"{format_local_timestamp(session_file.started_at)} - "
-            f"{format_local_timestamp(session_file.ended_at)} ({timezone_label}) - "
-            f"{entry.session_id} - "
-            f"{entry.thread_name}"
-        )
+        lines.append(format_indexed_session_line(entry, session_file))
 
     for session_file in session_files:
         if session_file.session_id and normalize_session_id(session_file.session_id) in indexed_ids:
@@ -545,6 +680,579 @@ def list_session_lines(
         lines.append(f"{session_file.relative_path} - {NO_SESSION_INDEX_ENTRY}")
 
     return lines
+
+
+def format_indexed_session_line(entry: SessionIndexEntry, session_file: SessionFile) -> str:
+    parts = []
+    timestamp_text = format_session_timestamps(session_file)
+    if timestamp_text:
+        parts.append(timestamp_text)
+    parts.extend([entry.session_id, entry.thread_name])
+    return " - ".join(parts)
+
+
+def format_session_timestamps(session_file: SessionFile) -> str:
+    timezone_source = session_file.ended_at or session_file.started_at
+    if session_file.started_at is not None and session_file.ended_at is not None:
+        return (
+            f"{format_local_timestamp(session_file.started_at)} - "
+            f"{format_local_timestamp(session_file.ended_at)} "
+            f"({local_timezone_offset_label(timezone_source)})"
+        )
+    if session_file.started_at is not None:
+        return (
+            f"{format_local_timestamp(session_file.started_at)} "
+            f"({local_timezone_offset_label(timezone_source)})"
+        )
+    if session_file.ended_at is not None:
+        return (
+            f"{format_local_timestamp(session_file.ended_at)} "
+            f"({local_timezone_offset_label(timezone_source)})"
+        )
+    return ""
+
+
+def session_info_for_search(
+    session_file: SessionFile, entries_by_id: dict[str, SessionIndexEntry]
+) -> str:
+    if session_file.session_id:
+        entry = entries_by_id.get(normalize_session_id(session_file.session_id))
+        if entry:
+            return format_indexed_session_line(entry, session_file)
+    return f"{session_file.relative_path} - {NO_SESSION_INDEX_ENTRY}"
+
+
+def parse_embedded_json(value: str) -> Any:
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "{[":
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+
+
+def render_search_text(value: Any) -> str:
+    if isinstance(value, str):
+        parsed = parse_embedded_json(value)
+        if parsed is not value:
+            return render_search_text(parsed)
+        return str(value)
+
+    if isinstance(value, dict):
+        lines = []
+        for key, inner in value.items():
+            rendered = render_search_text(inner)
+            if not rendered:
+                continue
+            if "\n" in rendered:
+                lines.extend([f"{key}:", rendered])
+            else:
+                lines.append(f"{key}: {rendered}")
+        return "\n".join(lines)
+
+    if isinstance(value, list):
+        return "\n".join(rendered for item in value if (rendered := render_search_text(item)))
+
+    if value is None:
+        return ""
+    return str(value)
+
+
+def session_search_text(input_path: Path, options: SearchOptions) -> str:
+    return "\n".join(session_search_lines(input_path, options))
+
+
+def session_search_lines(input_path: Path, options: SearchOptions) -> list[str]:
+    lines = []
+    seen_lines = set()
+    for _, raw_record in iter_jsonl_objects(input_path):
+        record = sanitize(raw_record, options.redaction)
+        for line in render_search_lines(record, options):
+            if line and line not in seen_lines:
+                seen_lines.add(line)
+                lines.append(line)
+    return lines
+
+
+def render_search_lines(record: dict[str, Any], options: SearchOptions) -> list[str]:
+    record_type = record.get("type")
+    payload = record.get("payload")
+
+    if record_type == "session_meta" and isinstance(payload, dict):
+        if not options.include_metadata:
+            return []
+        return render_session_metadata_search_lines(payload)
+
+    if record_type == "response_item" and isinstance(payload, dict):
+        payload_type = payload.get("type")
+        if payload_type == "message":
+            role = payload.get("role")
+            text = content_to_text(payload.get("content"))
+            if role == "assistant":
+                return render_labeled_search_lines("Codex", text)
+            if role == "user" and not is_injected_user_context(text):
+                return render_labeled_search_lines("User", text)
+            return []
+        if payload_type == "reasoning":
+            return []
+        if payload_type in {"function_call", "tool_search_call", "custom_tool_call"}:
+            if not options.include_tools:
+                return []
+            return render_tool_call_search_lines(payload)
+        return []
+
+    if record_type == "event_msg" and isinstance(payload, dict):
+        payload_type = payload.get("type")
+        if payload_type == "user_message":
+            return render_labeled_search_lines("User", payload.get("message", ""))
+        if payload_type == "agent_message":
+            return render_labeled_search_lines("Codex", payload.get("message", ""))
+
+    return []
+
+
+def render_labeled_search_lines(label: str, text: str) -> list[str]:
+    normalized_text = text.strip()
+    if not normalized_text:
+        return []
+    return [f"{label}: {line.strip()}" for line in normalized_text.splitlines() if line.strip()]
+
+
+def render_session_metadata_search_lines(payload: dict[str, Any]) -> list[str]:
+    lines = []
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd:
+        lines.append(f"Session metadata: cwd: {cwd}")
+
+    git = payload.get("git")
+    if isinstance(git, dict):
+        branch = git.get("branch")
+        if isinstance(branch, str) and branch:
+            lines.append(f"Session metadata: branch: {branch}")
+        repository_url = git.get("repository_url")
+        if isinstance(repository_url, str) and repository_url:
+            lines.append(f"Session metadata: repository_url: {repository_url}")
+
+    return lines
+
+
+def render_tool_call_search_lines(payload: dict[str, Any]) -> list[str]:
+    full_name = tool_display_name(payload)
+    arguments = payload.get("arguments") if "arguments" in payload else payload.get("input")
+    short_name = normalized_tool_short_name(full_name)
+
+    args = parse_json_object_maybe(arguments)
+    if short_name == "shell_command" and args is not None:
+        command = args.get("command")
+        if command:
+            return render_labeled_search_lines(f"Tool call: {full_name}", str(command))
+        return [f"Tool call: {full_name}"]
+
+    if short_name == "apply_patch" and arguments:
+        patch_preview = truncate_preview(str(arguments), DEFAULT_TOOL_PREVIEW_CHARS)
+        return render_labeled_search_lines(f"Tool call: {full_name}", patch_preview)
+
+    preview = render_smart_tool_call_preview(full_name, arguments, DEFAULT_TOOL_PREVIEW_CHARS)
+    if not preview:
+        return [f"Tool call: {full_name}"]
+
+    preview_lines = [
+        line
+        for line in preview
+        if not line.startswith("Workdir:")
+        and not line.startswith("Timeout ms:")
+        and not line.startswith("Call ID:")
+    ]
+    return [
+        f"Tool call: {full_name}: {line.strip()}"
+        for line in preview_lines
+        if line.strip() and not line.startswith("```")
+    ]
+
+
+def compile_search_pattern(options: SearchOptions) -> re.Pattern[str]:
+    if not options.pattern:
+        raise CliError("Search pattern must not be empty")
+    flags = re.IGNORECASE if options.ignore_case else 0
+    pattern = options.pattern if options.regex else re.escape(options.pattern)
+    try:
+        return re.compile(pattern, flags)
+    except re.error as exc:
+        raise CliError(f"Invalid regex pattern: {exc}") from exc
+
+
+def search_matching_lines(
+    lines: Sequence[str], search_pattern: re.Pattern[str], line_width: int
+) -> tuple[SearchLine, ...]:
+    matching_lines = []
+    for line in lines:
+        spans = [
+            match.span() for match in search_pattern.finditer(line) if match.start() != match.end()
+        ]
+        if spans:
+            matching_lines.append(make_search_line(line, spans, line_width))
+    return tuple(matching_lines)
+
+
+def make_search_line(
+    source_line: str,
+    matches: Sequence[tuple[int, int]],
+    line_width: int,
+) -> SearchLine:
+    width = max(20, line_width)
+    occurrence_count = len(matches)
+    if len(source_line) <= width:
+        return SearchLine(
+            text=source_line, matches=tuple(matches), occurrence_count=occurrence_count
+        )
+
+    prefix_end = search_line_prefix_end(source_line)
+    if prefix_end == -1 or any(start < prefix_end for start, _ in matches):
+        prefix_end = 0
+
+    prefix = source_line[:prefix_end]
+    if width - len(prefix) < 20:
+        prefix = ""
+        prefix_end = 0
+
+    content = source_line[prefix_end:]
+    content_matches = tuple((start - prefix_end, end - prefix_end) for start, end in matches)
+    snippet, snippet_matches = compact_line_content(content, content_matches, width - len(prefix))
+    adjusted_matches = tuple(
+        (start + len(prefix), end + len(prefix)) for start, end in snippet_matches
+    )
+    return SearchLine(
+        text=f"{prefix}{snippet}",
+        matches=adjusted_matches,
+        occurrence_count=occurrence_count,
+    )
+
+
+def search_line_prefix_end(source_line: str) -> int:
+    if source_line.startswith("Tool call: "):
+        second_separator = source_line.find(": ", len("Tool call: "))
+        if second_separator != -1 and second_separator <= 72:
+            return second_separator + 2
+
+    prefix_end = source_line.find(": ")
+    if prefix_end != -1 and prefix_end <= 48:
+        return prefix_end + 2
+    return -1
+
+
+def compact_line_content(
+    content: str,
+    matches: Sequence[tuple[int, int]],
+    width: int,
+) -> tuple[str, tuple[tuple[int, int], ...]]:
+    if len(content) <= width:
+        return content, tuple(matches)
+    if len(matches) == 1:
+        return centered_match_snippet(content, matches[0], width)
+    if len(matches) > MAX_MATCHES_BEFORE_LINE_OMISSION:
+        return compact_line_with_omission_note(content, matches, width)
+
+    for context_chars in compact_context_sizes(width):
+        chunks = merge_chunks(
+            (
+                max(0, start - context_chars),
+                min(len(content), end + context_chars),
+            )
+            for start, end in matches
+        )
+        snippet, snippet_matches = compose_compact_chunks(content, chunks, matches)
+        if len(snippet) <= width:
+            return snippet, snippet_matches
+
+    return centered_match_snippet(content, matches[0], width)
+
+
+def compact_line_with_omission_note(
+    content: str,
+    matches: Sequence[tuple[int, int]],
+    width: int,
+) -> tuple[str, tuple[tuple[int, int], ...]]:
+    visible_matches = tuple(matches[:MAX_VISIBLE_MATCHES_PER_OMITTED_LINE])
+    omitted_count = len(matches) - len(visible_matches)
+    note = f" ... (+{omitted_count} more on line)"
+    available_width = width - len(note)
+    if available_width < 20:
+        note = f" (+{omitted_count} more)"
+        available_width = max(1, width - len(note))
+
+    snippet, snippet_matches = centered_match_snippet(content, visible_matches[0], available_width)
+    return f"{snippet}{note}", snippet_matches
+
+
+def compact_context_sizes(width: int) -> tuple[int, ...]:
+    candidates = (
+        width,
+        width * 3 // 4,
+        width // 2,
+        width // 3,
+        96,
+        80,
+        64,
+        48,
+        40,
+        32,
+        24,
+        16,
+        10,
+        6,
+        3,
+        0,
+    )
+    return tuple(sorted({max(0, candidate) for candidate in candidates}, reverse=True))
+
+
+def merge_chunks(chunks: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in chunks:
+        if not merged or start > merged[-1][1] + 5:
+            merged.append((start, end))
+            continue
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, end))
+    return merged
+
+
+def compose_compact_chunks(
+    content: str,
+    chunks: Sequence[tuple[int, int]],
+    matches: Sequence[tuple[int, int]],
+) -> tuple[str, tuple[tuple[int, int], ...]]:
+    parts = []
+    adjusted_matches = []
+    cursor = 0
+
+    for index, (chunk_start, chunk_end) in enumerate(chunks):
+        if index == 0 and chunk_start > 0:
+            parts.append("...")
+            cursor += 3
+        elif index > 0:
+            parts.append(" ... ")
+            cursor += 5
+
+        chunk_text = content[chunk_start:chunk_end]
+        parts.append(chunk_text)
+        for match_start, match_end in matches:
+            visible_start = max(match_start, chunk_start)
+            visible_end = min(match_end, chunk_end)
+            if visible_start < visible_end:
+                adjusted_matches.append(
+                    (cursor + visible_start - chunk_start, cursor + visible_end - chunk_start)
+                )
+        cursor += len(chunk_text)
+
+    if chunks and chunks[-1][1] < len(content):
+        parts.append("...")
+
+    return "".join(parts), tuple(adjusted_matches)
+
+
+def centered_match_snippet(
+    content: str, match: tuple[int, int], width: int
+) -> tuple[str, tuple[tuple[int, int], ...]]:
+    match_start, match_end = match
+    prefix_marker = "..." if match_start > 0 else ""
+    suffix_marker = "..." if match_end < len(content) else ""
+    body_width = max(1, width - len(prefix_marker) - len(suffix_marker))
+    match_length = match_end - match_start
+    left_context = max(0, (body_width - match_length) // 2)
+    start = max(0, match_start - left_context)
+    end = min(len(content), start + body_width)
+    if end - start < body_width:
+        start = max(0, end - body_width)
+
+    prefix_marker = "..." if start > 0 else ""
+    suffix_marker = "..." if end < len(content) else ""
+    snippet = f"{prefix_marker}{content[start:end]}{suffix_marker}"
+    offset = len(prefix_marker) - start
+    visible_start = max(match_start, start)
+    visible_end = min(match_end, end)
+    snippet_matches: tuple[tuple[int, int], ...] = ()
+    if visible_start < visible_end:
+        snippet_matches = ((visible_start + offset, visible_end + offset),)
+    return snippet, snippet_matches
+
+
+def search_sessions(
+    codex_home: Path,
+    options: SearchOptions,
+    session_index_path: Path | None = None,
+    sessions_dir: Path | None = None,
+) -> tuple[list[SearchResult], list[str]]:
+    resolved_sessions_dir = sessions_dir or codex_home / "sessions"
+    if not resolved_sessions_dir.exists():
+        raise CliError(f"Sessions directory not found: {resolved_sessions_dir}")
+
+    index_path = session_index_path or codex_home / "session_index.jsonl"
+    index_entries = read_session_index(index_path)
+    entries_by_id = {normalize_session_id(entry.session_id): entry for entry in index_entries}
+    session_files = discover_session_files(resolved_sessions_dir, include_ended_at=True)
+    search_pattern = compile_search_pattern(options)
+
+    results = []
+    warnings = []
+    for session_file in session_files:
+        try:
+            search_lines = session_search_lines(session_file.path, options)
+        except (OSError, ValueError) as exc:
+            warnings.append(f"{session_file.relative_path}: {exc}")
+            continue
+
+        all_lines = search_matching_lines(search_lines, search_pattern, options.line_width)
+        if options.max_lines_per_session:
+            lines = all_lines[: options.max_lines_per_session]
+            omitted_occurrence_count = max(
+                0,
+                sum(line.occurrence_count for line in all_lines)
+                - sum(line.occurrence_count for line in lines),
+            )
+        else:
+            lines = all_lines
+            omitted_occurrence_count = 0
+
+        if lines:
+            results.append(
+                SearchResult(
+                    session_info=session_info_for_search(session_file, entries_by_id),
+                    lines=lines,
+                    omitted_occurrence_count=omitted_occurrence_count,
+                )
+            )
+
+    return results, warnings
+
+
+def text_with_highlights(line: SearchLine, encoding: str | None) -> Text:
+    rendered = Text()
+    position = 0
+    for start, end in line.matches:
+        rendered.append(encode_for_output(line.text[position:start], encoding), style="dim")
+        rendered.append(encode_for_output(line.text[start:end], encoding), style="bold bright_red")
+        position = end
+    rendered.append(encode_for_output(line.text[position:], encoding), style="dim")
+    return rendered
+
+
+def env_flag_enabled(value: str | None) -> bool:
+    return value is not None and value != "" and value != "0"
+
+
+def auto_color_disabled(environ: Mapping[str, str]) -> bool:
+    return "NO_COLOR" in environ or environ.get("CLICOLOR") == "0"
+
+
+def auto_color_forced(environ: Mapping[str, str]) -> bool:
+    return env_flag_enabled(environ.get("FORCE_COLOR")) or env_flag_enabled(
+        environ.get("CLICOLOR_FORCE")
+    )
+
+
+def is_msys_terminal_environment(environ: Mapping[str, str]) -> bool:
+    term = environ.get("TERM")
+    if not term or term == "dumb":
+        return False
+    return any(
+        environ.get(name)
+        for name in (
+            "MSYSTEM",
+            "MINGW_CHOST",
+            "MINTTY_PID",
+            "TERM_PROGRAM",
+        )
+    )
+
+
+def is_windows_pipe_stream(stream: TextIO) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        import msvcrt
+
+        handle = msvcrt.get_osfhandle(stream.fileno())
+    except (AttributeError, OSError, ValueError):
+        return False
+    if handle == -1:
+        return False
+    file_type = ctypes.windll.kernel32.GetFileType(handle)
+    return bool(file_type == 0x0003)
+
+
+def console_color_options(
+    color: str,
+    stream: TextIO,
+    environ: Mapping[str, str] = os.environ,
+) -> tuple[bool | None, bool | None]:
+    if color == "always":
+        return True, False
+    if color == "never":
+        return False, True
+    if auto_color_disabled(environ):
+        return None, True
+    if auto_color_forced(environ):
+        return True, False
+    if is_msys_terminal_environment(environ) and is_windows_pipe_stream(stream):
+        return True, False
+    return None, False
+
+
+def render_search_results(
+    results: Sequence[SearchResult], warnings: Sequence[str], color: str
+) -> None:
+    stdout_force_terminal, stdout_no_color = console_color_options(color, sys.stdout)
+    stderr_force_terminal, stderr_no_color = console_color_options(color, sys.stderr)
+    console = Console(
+        file=sys.stdout,
+        force_terminal=stdout_force_terminal,
+        no_color=stdout_no_color,
+        highlight=False,
+        legacy_windows=False,
+    )
+    error_console = Console(
+        file=sys.stderr,
+        force_terminal=stderr_force_terminal,
+        no_color=stderr_no_color,
+        highlight=False,
+        legacy_windows=False,
+    )
+
+    for warning in warnings:
+        error_console.print(
+            Text(
+                encode_for_output(f"Warning: {warning}", sys.stderr.encoding),
+                style="yellow",
+            ),
+            soft_wrap=True,
+        )
+
+    for result_index, result in enumerate(results):
+        if result_index:
+            console.print()
+        console.print(
+            Text(encode_for_output(result.session_info, sys.stdout.encoding), style="bold"),
+            soft_wrap=True,
+        )
+        for line in result.lines:
+            rendered_line = Text()
+            rendered_line.append("  ", style="dim")
+            rendered_line.append_text(text_with_highlights(line, sys.stdout.encoding))
+            console.print(rendered_line, soft_wrap=True)
+        if result.omitted_occurrence_count:
+            console.print(
+                Text(
+                    (
+                        f"  (+{result.omitted_occurrence_count} more occurrences; "
+                        "use --max-lines-per-session 0 to show all)"
+                    ),
+                    style="dim",
+                ),
+                soft_wrap=True,
+            )
 
 
 def encode_for_output(text: str, encoding: str | None) -> str:
@@ -707,26 +1415,196 @@ def resolve_markdown_tool_mode(markdown_features: set[str], requested_mode: str)
     return requested_mode
 
 
-def content_to_text(content: Any) -> str:
+@dataclass(frozen=True)
+class DataImageUrl:
+    media_type: str
+    encoded_data: str
+
+
+class MarkdownImageHandler:
+    def __init__(self, mode: str, output_path: Path, input_path: Path) -> None:
+        self.mode = mode
+        self.output_path = output_path
+        self.input_path = input_path
+        self.asset_dir = output_path.with_name(f"{output_path.stem}_assets")
+        self._links_by_url: dict[str, str] = {}
+        self.source_line_number: int | None = None
+
+    def set_source_line(self, line_number: int) -> None:
+        self.source_line_number = line_number
+
+    def render_image(self, image_url: Any, label: str = "image") -> str:
+        if not isinstance(image_url, str):
+            return f"[{label}: missing image_url]"
+
+        data_image = parse_data_image_url(image_url)
+        if data_image is None:
+            return f"[{label}: {image_url}]"
+
+        if self.mode == "inline":
+            return "\n".join(
+                [
+                    self.inline_image_comment(),
+                    f"![{label}]({image_url})",
+                ]
+            )
+        if self.mode == "extract":
+            link = self.extract_data_image(image_url, data_image)
+            if link:
+                return f"![{label}]({link})"
+            return f"[{label}: invalid {data_image.media_type} data URL]"
+        return f"[{label}: {self.describe_truncated_image(data_image)}]"
+
+    def transform_value(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: self.transform_value(inner) for key, inner in value.items()}
+        if isinstance(value, list):
+            return [self.transform_value(item) for item in value]
+        if isinstance(value, str):
+            data_image = parse_data_image_url(value)
+            if data_image is None:
+                return value
+            if self.mode == "inline":
+                return value
+            if self.mode == "extract":
+                link = self.extract_data_image(value, data_image)
+                return link if link else f"[invalid {data_image.media_type} data URL]"
+            return (
+                f"data:{data_image.media_type};base64,{self.describe_truncated_image(data_image)}"
+            )
+        return value
+
+    def extract_data_image(self, image_url: str, data_image: DataImageUrl) -> str | None:
+        if image_url in self._links_by_url:
+            return self._links_by_url[image_url]
+
+        try:
+            image_bytes = base64.b64decode("".join(data_image.encoded_data.split()), validate=True)
+        except (binascii.Error, ValueError):
+            return None
+
+        digest = hashlib.sha256(image_bytes).hexdigest()[:12]
+        extension = image_extension(data_image.media_type)
+        filename = f"image-{len(self._links_by_url) + 1:03d}-{digest}.{extension}"
+        self.asset_dir.mkdir(parents=True, exist_ok=True)
+        image_path = self.asset_dir / filename
+        if not image_path.exists():
+            image_path.write_bytes(image_bytes)
+
+        link = markdown_relative_link(image_path, self.output_path)
+        self._links_by_url[image_url] = link
+        return link
+
+    def describe_truncated_image(self, data_image: DataImageUrl) -> str:
+        return describe_data_image(data_image, self.source_reference())
+
+    def source_reference(self) -> str:
+        source = str(self.input_path)
+        if self.source_line_number is not None:
+            source = f"{source}:{self.source_line_number}"
+        return markdown_code_span(source)
+
+    def source_comment_reference(self) -> str:
+        source = str(self.input_path)
+        if self.source_line_number is not None:
+            source = f"{source}:{self.source_line_number}"
+        return escape_markdown_reference_comment_text(source)
+
+    def inline_image_comment(self) -> str:
+        return (
+            "[//]: # (Inline image; use --md-images truncate or --md-images extract; "
+            f"Source: {self.source_comment_reference()}.)"
+        )
+
+
+def parse_data_image_url(value: str) -> DataImageUrl | None:
+    match = DATA_IMAGE_URL_RE.match(value)
+    if not match:
+        return None
+    return DataImageUrl(
+        media_type=match.group(1).lower(),
+        encoded_data=match.group(2),
+    )
+
+
+def describe_data_image(data_image: DataImageUrl, source_reference: str | None = None) -> str:
+    compact_data = "".join(data_image.encoded_data.split())
+    base64_prefix = compact_data[:DATA_IMAGE_PREFIX_CHARS]
+    if len(compact_data) > DATA_IMAGE_PREFIX_CHARS:
+        base64_prefix = f"{base64_prefix}..."
+    parts = [
+        f"{data_image.media_type} data URL",
+        f"{len(compact_data)} base64 chars truncated",
+    ]
+    if source_reference:
+        parts.append(f"source {source_reference}")
+    parts.append(f"base64 prefix {markdown_code_span(base64_prefix)}")
+    return "; ".join(parts)
+
+
+def image_extension(media_type: str) -> str:
+    extension = IMAGE_EXTENSION_BY_MIME_TYPE.get(media_type)
+    if extension:
+        return extension
+    subtype = media_type.split("/", 1)[-1].split("+", 1)[0].lower()
+    sanitized = re.sub(r"[^a-z0-9]+", "", subtype)
+    return sanitized or "bin"
+
+
+def markdown_relative_link(target_path: Path, markdown_path: Path) -> str:
+    relative_path = os.path.relpath(target_path, start=markdown_path.parent)
+    return quote(Path(relative_path).as_posix(), safe="/._-")
+
+
+def markdown_code_span(text: str) -> str:
+    if "`" not in text:
+        return f"`{text}`"
+    return f"`` {text} ``"
+
+
+def escape_markdown_reference_comment_text(text: str) -> str:
+    return text.replace("\r", " ").replace("\n", " ").replace(")", r"\)")
+
+
+def content_to_text(content: Any, image_handler: MarkdownImageHandler | None = None) -> str:
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
-        return render_json_block_content(content)
+        value = image_handler.transform_value(content) if image_handler else content
+        return render_json_block_content(value)
 
+    has_image_item = any(is_image_content_item(item) for item in content)
     parts = []
     for item in content:
         if isinstance(item, dict):
             if isinstance(item.get("text"), str):
-                parts.append(item["text"])
-            elif item.get("type") == "image_url":
-                parts.append(f"[image: {item.get('image_url', '')}]")
+                text = item["text"]
+                if has_image_item and is_image_wrapper_text(text):
+                    continue
+                parts.append(text)
+            elif is_image_content_item(item):
+                if image_handler:
+                    parts.append(image_handler.render_image(item.get("image_url"), "input image"))
+                else:
+                    parts.append(f"[input image: {item.get('image_url', '')}]")
             elif item.get("type") == "local_image":
                 parts.append(f"[local image: {item.get('path') or item.get('name') or ''}]")
             else:
-                parts.append(render_json_block_content(item))
+                value = image_handler.transform_value(item) if image_handler else item
+                parts.append(render_json_block_content(value))
         else:
             parts.append(str(item))
     return "\n\n".join(part for part in parts if part)
+
+
+def is_image_content_item(item: Any) -> bool:
+    return isinstance(item, dict) and (
+        item.get("type") in {"image_url", "input_image"} or "image_url" in item
+    )
+
+
+def is_image_wrapper_text(text: str) -> bool:
+    return text.strip().lower() in {"<image>", "</image>"}
 
 
 def is_injected_user_context(text: str) -> bool:
@@ -795,7 +1673,9 @@ def fenced_block(content: str, language: str = "") -> str:
     return f"{fence}{suffix}\n{content}\n{fence}"
 
 
-def parse_json_maybe(value: Any) -> tuple[str, str]:
+def parse_json_maybe(
+    value: Any, image_handler: MarkdownImageHandler | None = None
+) -> tuple[str, str]:
     if isinstance(value, str):
         stripped = value.strip()
         if stripped.startswith("{") or stripped.startswith("["):
@@ -803,8 +1683,16 @@ def parse_json_maybe(value: Any) -> tuple[str, str]:
                 parsed = json.loads(stripped)
             except json.JSONDecodeError:
                 return value, "text"
+            if image_handler:
+                parsed = image_handler.transform_value(parsed)
             return render_json_block_content(parsed), "json"
+        if image_handler:
+            transformed = image_handler.transform_value(value)
+            if transformed != value:
+                return str(transformed), "text"
         return value, "text"
+    if image_handler:
+        value = image_handler.transform_value(value)
     return render_json_block_content(value), "json"
 
 
@@ -855,8 +1743,13 @@ def truncate_preview(text: str, max_chars: int) -> str:
     return f"{text[:max_chars].rstrip()}\n\n... [truncated, {omitted} characters omitted]"
 
 
-def render_preview_block(label: str, value: Any, max_chars: int) -> list[str]:
-    body, language = parse_json_maybe(value)
+def render_preview_block(
+    label: str,
+    value: Any,
+    max_chars: int,
+    image_handler: MarkdownImageHandler | None = None,
+) -> list[str]:
+    body, language = parse_json_maybe(value, image_handler)
     return ["", label, fenced_block(truncate_preview(body, max_chars), language)]
 
 
@@ -922,7 +1815,7 @@ def render_smart_tool_call_preview(
         return None
 
     if short_name == "shell_command":
-        append_fenced_preview(lines, "Preview:", args.get("command"), preview_chars)
+        append_fenced_preview(lines, "Command preview:", args.get("command"), preview_chars)
         append_inline_preview(lines, "Workdir", args.get("workdir"), preview_chars)
         append_inline_preview(lines, "Timeout ms", args.get("timeout_ms"), preview_chars)
         return lines or None
@@ -1117,7 +2010,10 @@ def render_smart_tool_call_preview(
 
 
 def render_tool_call(
-    payload: dict[str, Any], mode: str, preview_chars: int
+    payload: dict[str, Any],
+    mode: str,
+    preview_chars: int,
+    image_handler: MarkdownImageHandler | None = None,
 ) -> tuple[str, str | None]:
     full_name = tool_display_name(payload)
     lines = [f"**Tool call:** `{full_name}`"]
@@ -1135,9 +2031,11 @@ def render_tool_call(
 
     if arguments is not None:
         if mode == "preview":
-            lines.extend(render_preview_block("Arguments preview:", arguments, preview_chars))
+            lines.extend(
+                render_preview_block("Arguments preview:", arguments, preview_chars, image_handler)
+            )
         else:
-            body, language = parse_json_maybe(arguments)
+            body, language = parse_json_maybe(arguments, image_handler)
             lines.extend(["", "Arguments:", fenced_block(body, language)])
     else:
         remaining = {
@@ -1147,8 +2045,14 @@ def render_tool_call(
         }
         if remaining:
             if mode == "preview":
-                lines.extend(render_preview_block("Payload preview:", remaining, preview_chars))
+                lines.extend(
+                    render_preview_block(
+                        "Payload preview:", remaining, preview_chars, image_handler
+                    )
+                )
             else:
+                if image_handler:
+                    remaining = image_handler.transform_value(remaining)
                 lines.extend(["", fenced_block(render_json_block_content(remaining), "json")])
     return "\n".join(lines), full_name
 
@@ -1158,6 +2062,7 @@ def render_tool_output(
     mode: str,
     preview_chars: int,
     tool_names_by_call_id: dict[str, str],
+    image_handler: MarkdownImageHandler | None = None,
 ) -> str:
     call_type = payload.get("type", "tool_output")
     call_id = payload.get("call_id")
@@ -1169,15 +2074,16 @@ def render_tool_output(
         return "\n".join(lines)
 
     if "output" in payload:
-        body, language = parse_json_maybe(payload["output"])
+        body, language = parse_json_maybe(payload["output"], image_handler)
     else:
-        body = render_json_block_content(
-            {
-                key: value
-                for key, value in payload.items()
-                if key not in {"type", "call_id", "status", "execution"}
-            }
-        )
+        remaining = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"type", "call_id", "status", "execution"}
+        }
+        if image_handler:
+            remaining = image_handler.transform_value(remaining)
+        body = render_json_block_content(remaining)
         language = "json"
     if mode == "preview":
         lines.extend(
@@ -1192,7 +2098,11 @@ def render_tool_output(
     return "\n".join(lines)
 
 
-def render_reasoning(payload: dict[str, Any], redaction: str) -> str:
+def render_reasoning(
+    payload: dict[str, Any],
+    redaction: str,
+    image_handler: MarkdownImageHandler | None = None,
+) -> str:
     if (
         not payload.get("summary")
         and not payload.get("content")
@@ -1207,7 +2117,11 @@ def render_reasoning(payload: dict[str, Any], redaction: str) -> str:
         lines.extend(["", "Summary:"])
         if isinstance(summary, list):
             for item in summary:
-                text = content_to_text(item.get("content")) if isinstance(item, dict) else str(item)
+                text = (
+                    content_to_text(item.get("content"), image_handler)
+                    if isinstance(item, dict)
+                    else str(item)
+                )
                 if text:
                     lines.append(f"- {text}")
         else:
@@ -1215,7 +2129,7 @@ def render_reasoning(payload: dict[str, Any], redaction: str) -> str:
 
     content = payload.get("content")
     if content:
-        lines.extend(["", content_to_text(content)])
+        lines.extend(["", content_to_text(content, image_handler)])
     elif payload.get("encrypted_content") is not None:
         lines.extend(["", f"`encrypted_content`: {redaction}"])
 
@@ -1230,22 +2144,31 @@ def metadata_title(record: dict[str, Any]) -> str:
     return f"Metadata: `{record_type}`"
 
 
-def render_metadata(record: dict[str, Any]) -> str:
+def render_metadata(
+    record: dict[str, Any],
+    image_handler: MarkdownImageHandler | None = None,
+) -> str:
+    rendered_record = image_handler.transform_value(record) if image_handler else record
     return "\n".join(
         [
             f"Timestamp: `{record.get('timestamp', '')}`",
             "",
-            render_markdown_table(record),
+            render_markdown_table(rendered_record),
         ]
     )
 
 
-def render_raw_record(line_number: int, record: dict[str, Any]) -> str:
+def render_raw_record(
+    line_number: int,
+    record: dict[str, Any],
+    image_handler: MarkdownImageHandler | None = None,
+) -> str:
+    rendered_record = image_handler.transform_value(record) if image_handler else record
     return "\n".join(
         [
             f"Line: `{line_number}`",
             "",
-            fenced_block(render_json_block_content(record), "json"),
+            fenced_block(render_json_block_content(rendered_record), "json"),
         ]
     )
 
@@ -1277,6 +2200,7 @@ def convert_jsonl_to_markdown(input_path: Path, output_path: Path, options: Mark
     count = 0
     seen_dialogue: set[tuple[str, str]] = set()
     tool_names_by_call_id: dict[str, str] = {}
+    image_handler = MarkdownImageHandler(options.image_mode, output_path, input_path)
 
     def write_dialogue(dst: TextIO, title: str, body: str) -> None:
         nonlocal count
@@ -1300,6 +2224,7 @@ def convert_jsonl_to_markdown(input_path: Path, output_path: Path, options: Mark
 
     with output_path.open("w", encoding="utf-8", newline="\n") as dst:
         for line_number, raw_record in iter_jsonl_objects(input_path):
+            image_handler.set_source_line(line_number)
             record = sanitize(raw_record, options.redaction)
             record_type = record.get("type")
             payload = record.get("payload")
@@ -1309,7 +2234,7 @@ def convert_jsonl_to_markdown(input_path: Path, output_path: Path, options: Mark
                 payload_type = payload.get("type")
                 if payload_type == "message":
                     role = payload.get("role")
-                    text = content_to_text(payload.get("content"))
+                    text = content_to_text(payload.get("content"), image_handler)
                     if role == "assistant":
                         write_dialogue(dst, "Codex", text)
                         handled = True
@@ -1317,12 +2242,19 @@ def convert_jsonl_to_markdown(input_path: Path, output_path: Path, options: Mark
                         write_dialogue(dst, "User", text)
                         handled = True
                 elif payload_type == "reasoning":
-                    write_section(dst, "Codex", render_reasoning(payload, options.redaction))
+                    write_section(
+                        dst,
+                        "Codex",
+                        render_reasoning(payload, options.redaction, image_handler),
+                    )
                     handled = True
                 elif payload_type in {"function_call", "tool_search_call", "custom_tool_call"}:
                     if options.tool_mode != "none":
                         rendered_tool_call, tool_name = render_tool_call(
-                            payload, options.tool_mode, options.tool_preview_chars
+                            payload,
+                            options.tool_mode,
+                            options.tool_preview_chars,
+                            image_handler,
                         )
                         call_id = payload.get("call_id")
                         if call_id and tool_name:
@@ -1343,6 +2275,7 @@ def convert_jsonl_to_markdown(input_path: Path, output_path: Path, options: Mark
                                 options.tool_mode,
                                 options.tool_preview_chars,
                                 tool_names_by_call_id,
+                                image_handler,
                             ),
                         )
                     handled = True
@@ -1357,11 +2290,19 @@ def convert_jsonl_to_markdown(input_path: Path, output_path: Path, options: Mark
                     handled = True
 
             if not handled and options.include_metadata and is_metadata_record(record):
-                write_section(dst, metadata_title(record), render_metadata(record))
+                write_section(
+                    dst,
+                    metadata_title(record),
+                    render_metadata(record, image_handler),
+                )
                 handled = True
 
             if not handled and options.include_raw:
-                write_section(dst, "Raw", render_raw_record(line_number, record))
+                write_section(
+                    dst,
+                    "Raw",
+                    render_raw_record(line_number, record, image_handler),
+                )
 
     return count
 
@@ -1391,10 +2332,58 @@ def run_list_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_search_command(args: argparse.Namespace) -> int:
+    if args.line_width < 20:
+        raise SystemExit("--line-width must be at least 20")
+    if args.max_lines_per_session < 0:
+        raise SystemExit("--max-lines-per-session must be zero or greater")
+
+    codex_home = args.codex_home.expanduser().resolve()
+    session_index_path = (
+        args.session_index.expanduser().resolve()
+        if args.session_index
+        else codex_home / "session_index.jsonl"
+    )
+    sessions_dir = (
+        args.sessions_dir.expanduser().resolve() if args.sessions_dir else codex_home / "sessions"
+    )
+    options = SearchOptions(
+        pattern=args.pattern,
+        regex=args.regex,
+        ignore_case=args.ignore_case,
+        line_width=args.line_width,
+        max_lines_per_session=args.max_lines_per_session,
+        include_metadata=args.metadata or args.all,
+        include_tools=args.tools or args.all,
+        color=args.color,
+        redaction=args.redact_encrypted,
+    )
+
+    try:
+        results, warnings = search_sessions(
+            codex_home=codex_home,
+            options=options,
+            session_index_path=session_index_path,
+            sessions_dir=sessions_dir,
+        )
+    except (CliError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+    try:
+        render_search_results(results, warnings, args.color)
+    except OSError as exc:
+        if exc.errno not in {errno.EINVAL, errno.EPIPE}:
+            raise
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    return 0 if results else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if raw_argv[:1] == ["list"]:
         return run_list_command(parse_list_args(raw_argv[1:]))
+    if raw_argv[:1] in (["find"], ["grep"]):
+        return run_search_command(parse_search_args(raw_argv[0], raw_argv[1:]))
 
     args = parse_args(raw_argv)
     codex_home = args.codex_home.expanduser().resolve()
@@ -1433,6 +2422,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     include_metadata="metadata" in markdown_features,
                     include_raw="raw" in markdown_features,
                     redaction=args.redact_encrypted,
+                    image_mode=args.md_images,
                 ),
             )
         except ValueError as exc:

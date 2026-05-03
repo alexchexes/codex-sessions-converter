@@ -79,6 +79,21 @@ codex-sessions-converter --md sessions/YYYY/MM/DD/rollout.jsonl
 
 The longer `--format md` form is also supported.
 
+Markdown output truncates base64 data images by default so large screenshots do
+not fill the `.md` file with inline image payloads. The placeholder includes
+the original rollout path/line and a short base64 prefix so the image can still
+be found in the source JSONL. To write those images as real files next to the
+Markdown and link them from the document, use:
+
+```bash
+codex-sessions-converter --md --md-images extract sessions/YYYY/MM/DD/rollout.jsonl
+```
+
+Extracted images are written to a sibling `<markdown-stem>_assets/` directory.
+Use `--md-images inline` only when you want to keep base64 image data inline in
+the Markdown; inline images include a hidden comment pointing back to truncation
+or extraction mode for future cleanup.
+
 When no output path is supplied, the converter writes under the Codex home
 directory, not the current directory. Codex home defaults to `CODEX_HOME` or
 `~/.codex`, so a session rollout normally writes to a path like
@@ -122,6 +137,43 @@ Use a specific Codex home directory:
 ```bash
 codex-sessions-converter list --codex-home ~/.codex
 ```
+
+Search all Codex sessions:
+
+```bash
+codex-sessions-converter find -i "dadata-sdk"
+```
+
+By default, `find` searches visible user and Codex messages only. Use
+`--metadata` to also search compact session metadata such as cwd and repository
+URL, `--tools` to also search concise tool call previews such as shell commands,
+or `--all` to include both.
+
+`grep` is an alias for `find`:
+
+```bash
+codex-sessions-converter grep -i "dadata-sdk"
+```
+
+Use regex mode with `-r`, `--regex`, or the grep-style `-E` alias:
+
+```bash
+codex-sessions-converter find -i -r "dadata-[a-z]+"
+```
+
+Adjust the maximum width of each matching line:
+
+```bash
+codex-sessions-converter find --line-width 220 "dadata-sdk"
+```
+
+By default, `find` shows up to 5 matching lines per session. Use `-m` or
+`--max-lines-per-session` to change the limit, or pass `0` to show all matching
+lines.
+
+Matches are highlighted with terminal colors by default when stdout is a
+terminal, including Git Bash/MSYS terminals on Windows. Use `--color always` or
+`--color never` to override auto-detection.
 
 ## Codex Skill
 
@@ -193,7 +245,7 @@ names and call IDs.
   compactly in Markdown.
 - Markdown metadata tables escape pipe characters and replace embedded newlines
   with `<br>`.
-- The converter uses only the Python standard library.
+- The converter uses Rich for colored search output.
 
 ## License
 

@@ -1,3 +1,4 @@
+import base64
 import json
 import sys
 import tempfile
@@ -6,12 +7,14 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from codex_sessions_converter.converter import (  # noqa: E402
     MarkdownOptions,
+    console_color_options,
     convert_jsonl_to_markdown,
     convert_jsonl_to_yaml_stream,
     default_output_path,
@@ -153,6 +156,223 @@ class ConverterTests(unittest.TestCase):
             output = output_path.read_text(encoding="utf-8")
             self.assertIn("Output preview:", output)
             self.assertIn("truncated", output)
+
+    def test_markdown_truncates_data_images_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "rollout.jsonl"
+            output_path = Path(tmpdir) / "rollout.md"
+            encoded_image = base64.b64encode(b"fake png bytes" * 10).decode("ascii")
+            expected_prefix = f"{encoded_image[:24]}..."
+            image_url = f"data:image/png;base64,{encoded_image}"
+            write_jsonl(
+                input_path,
+                [
+                    {
+                        "timestamp": "2026-04-26T00:00:00Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "see this"},
+                                {"type": "input_text", "text": "<image>"},
+                                {"type": "input_image", "image_url": image_url},
+                                {"type": "input_text", "text": "</image>"},
+                            ],
+                        },
+                    }
+                ],
+            )
+
+            count = convert_jsonl_to_markdown(
+                input_path,
+                output_path,
+                MarkdownOptions(
+                    tool_mode="none",
+                    tool_preview_chars=80,
+                    include_metadata=False,
+                    include_raw=False,
+                    redaction="...",
+                ),
+            )
+
+            output = output_path.read_text(encoding="utf-8")
+            self.assertEqual(count, 1)
+            self.assertIn("see this", output)
+            self.assertIn("[input image: image/png data URL;", output)
+            self.assertIn("base64 chars truncated", output)
+            self.assertIn(f"source `{input_path}:1`", output)
+            self.assertIn(f"base64 prefix `{expected_prefix}`", output)
+            self.assertNotIn(encoded_image, output)
+            self.assertNotIn("<image>", output)
+            self.assertNotIn("</image>", output)
+
+    def test_markdown_extracts_data_images(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "rollout.jsonl"
+            output_path = Path(tmpdir) / "rollout.md"
+            image_bytes = b"fake png bytes"
+            encoded_image = base64.b64encode(image_bytes).decode("ascii")
+            image_url = f"data:image/png;base64,{encoded_image}"
+            write_jsonl(
+                input_path,
+                [
+                    {
+                        "timestamp": "2026-04-26T00:00:00Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "<image>"},
+                                {"type": "input_image", "image_url": image_url},
+                                {"type": "input_text", "text": "</image>"},
+                            ],
+                        },
+                    }
+                ],
+            )
+
+            count = convert_jsonl_to_markdown(
+                input_path,
+                output_path,
+                MarkdownOptions(
+                    tool_mode="none",
+                    tool_preview_chars=80,
+                    include_metadata=False,
+                    include_raw=False,
+                    redaction="...",
+                    image_mode="extract",
+                ),
+            )
+
+            output = output_path.read_text(encoding="utf-8")
+            image_files = list((Path(tmpdir) / "rollout_assets").glob("image-*.png"))
+            self.assertEqual(count, 1)
+            self.assertEqual(len(image_files), 1)
+            self.assertEqual(image_files[0].read_bytes(), image_bytes)
+            self.assertIn("![input image](rollout_assets/image-", output)
+            self.assertNotIn(encoded_image, output)
+            self.assertNotIn("<image>", output)
+            self.assertNotIn("</image>", output)
+
+    def test_markdown_inline_data_images_adds_hidden_extraction_note(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "rollout.jsonl"
+            output_path = Path(tmpdir) / "rollout.md"
+            encoded_image = base64.b64encode(b"fake png bytes" * 10).decode("ascii")
+            image_url = f"data:image/png;base64,{encoded_image}"
+            write_jsonl(
+                input_path,
+                [
+                    {
+                        "timestamp": "2026-04-26T00:00:00Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_image", "image_url": image_url},
+                            ],
+                        },
+                    }
+                ],
+            )
+
+            convert_jsonl_to_markdown(
+                input_path,
+                output_path,
+                MarkdownOptions(
+                    tool_mode="none",
+                    tool_preview_chars=80,
+                    include_metadata=False,
+                    include_raw=False,
+                    redaction="...",
+                    image_mode="inline",
+                ),
+            )
+
+            output = output_path.read_text(encoding="utf-8")
+            self.assertIn("[//]: # (Inline image;", output)
+            self.assertIn("--md-images truncate", output)
+            self.assertIn("--md-images extract", output)
+            self.assertNotIn("To keep the Markdown small", output)
+            self.assertNotIn("&#45;&#45;", output)
+            self.assertIn(f"Source: {input_path}:1.", output)
+            self.assertIn(f"![input image]({image_url})", output)
+
+    def test_markdown_keeps_literal_image_tags_without_image_item(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "rollout.jsonl"
+            output_path = Path(tmpdir) / "rollout.md"
+            write_jsonl(
+                input_path,
+                [
+                    {
+                        "timestamp": "2026-04-26T00:00:00Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "<image>"},
+                            ],
+                        },
+                    }
+                ],
+            )
+
+            convert_jsonl_to_markdown(
+                input_path,
+                output_path,
+                MarkdownOptions(
+                    tool_mode="none",
+                    tool_preview_chars=80,
+                    include_metadata=False,
+                    include_raw=False,
+                    redaction="...",
+                ),
+            )
+
+            output = output_path.read_text(encoding="utf-8")
+            self.assertIn("<image>", output)
+
+    def test_markdown_full_raw_truncates_data_images(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "rollout.jsonl"
+            output_path = Path(tmpdir) / "rollout.md"
+            encoded_image = base64.b64encode(b"fake png bytes" * 10).decode("ascii")
+            expected_prefix = f"{encoded_image[:24]}..."
+            image_url = f"data:image/png;base64,{encoded_image}"
+            write_jsonl(
+                input_path,
+                [
+                    {
+                        "timestamp": "2026-04-26T00:00:00Z",
+                        "type": "unknown",
+                        "payload": {"image_url": image_url},
+                    }
+                ],
+            )
+
+            count = convert_jsonl_to_markdown(
+                input_path,
+                output_path,
+                MarkdownOptions(
+                    tool_mode="none",
+                    tool_preview_chars=80,
+                    include_metadata=False,
+                    include_raw=True,
+                    redaction="...",
+                ),
+            )
+
+            output = output_path.read_text(encoding="utf-8")
+            self.assertEqual(count, 1)
+            self.assertIn("data:image/png;base64,image/png data URL;", output)
+            self.assertIn("rollout.jsonl:1", output)
+            self.assertIn(f"base64 prefix `{expected_prefix}`", output)
+            self.assertNotIn(encoded_image, output)
 
     def test_markdown_smart_mode_falls_back_to_names_for_unknown_tool_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -615,6 +835,517 @@ class ConverterTests(unittest.TestCase):
                 buffer.getvalue().splitlines(),
                 [f"{session_id} - CLI list - NO ROLLOUT FILE"],
             )
+
+    def test_find_searches_deserialized_text_and_groups_by_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "77777777-7777-7777-7777-777777777777"
+            write_jsonl(
+                codex_home / "session_index.jsonl",
+                [{"id": session_id, "thread_name": "Dadata integration"}],
+            )
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "session_meta",
+                        "payload": {"id": session_id},
+                    },
+                    {
+                        "timestamp": "2026-04-30T18:21:00Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": 'Install "dadata-sdk"\nThen run it',
+                        },
+                    },
+                ],
+            )
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(["find", "-i", "dadata-sdk", "--codex-home", str(codex_home)])
+
+            output = buffer.getvalue()
+            self.assertEqual(result, 0)
+            self.assertIn(f"{session_id} - Dadata integration", output)
+            self.assertIn('Install "dadata-sdk"', output)
+            self.assertNotIn("Then run it", output)
+            self.assertNotIn("\\n", output)
+            self.assertNotIn('\\"', output)
+
+    def test_find_searches_visible_messages_only_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+            write_jsonl(
+                codex_home / "session_index.jsonl",
+                [{"id": session_id, "thread_name": "Repo investigation"}],
+            )
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "session_meta",
+                        "payload": {
+                            "id": session_id,
+                            "cwd": r"d:\repos\copy-as-markdown",
+                            "base_instructions": {
+                                "text": "Large raw instructions mentioning copy-as-markdown"
+                            },
+                            "git": {
+                                "branch": "main",
+                                "repository_url": (
+                                    "https://github.com/yorkxin/copy-as-markdown.git"
+                                ),
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": "2026-04-30T18:21:00Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": "Discuss copy-as-markdown behavior",
+                        },
+                    },
+                    {
+                        "timestamp": "2026-04-30T18:22:00Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "shell_command",
+                            "arguments": (
+                                '{"command":"Get-Content package.json",'
+                                '"workdir":"d:\\\\repos\\\\copy-as-markdown"}'
+                            ),
+                        },
+                    },
+                    {
+                        "timestamp": "2026-04-30T18:22:01Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": "copy-as-markdown should not be searched in outputs",
+                        },
+                    },
+                ],
+            )
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(["find", "copy-as-markdown", "--codex-home", str(codex_home)])
+
+            output = buffer.getvalue()
+            self.assertEqual(result, 0)
+            self.assertIn("Codex: Discuss copy-as-markdown behavior", output)
+            self.assertNotIn("Session metadata:", output)
+            self.assertNotIn(r"cwd: d:\repos\copy-as-markdown", output)
+            self.assertNotIn(
+                "repository_url: https://github.com/yorkxin/copy-as-markdown.git", output
+            )
+            self.assertNotIn("base_instructions", output)
+            self.assertNotIn("Large raw instructions", output)
+            self.assertNotIn("should not be searched in outputs", output)
+            self.assertNotIn("Tool call", output)
+
+    def test_find_metadata_and_tools_are_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+            session_path = sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl"
+            write_jsonl(
+                session_path,
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "session_meta",
+                        "payload": {
+                            "id": session_id,
+                            "cwd": r"d:\repos\copy-as-markdown",
+                            "git": {
+                                "repository_url": (
+                                    "https://github.com/yorkxin/copy-as-markdown.git"
+                                )
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": "2026-04-30T18:21:00Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "shell_command",
+                            "arguments": (
+                                '{"command":"rg copy-as-markdown",'
+                                '"workdir":"d:\\\\repos\\\\copy-as-markdown"}'
+                            ),
+                        },
+                    },
+                ],
+            )
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                default_result = main(["find", "copy-as-markdown", "--codex-home", str(codex_home)])
+            self.assertEqual(default_result, 1)
+            self.assertEqual(buffer.getvalue(), "")
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                metadata_result = main(
+                    ["find", "--metadata", "copy-as-markdown", "--codex-home", str(codex_home)]
+                )
+            self.assertEqual(metadata_result, 0)
+            self.assertIn("Session metadata:", buffer.getvalue())
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                tools_result = main(
+                    ["find", "--tools", "copy-as-markdown", "--codex-home", str(codex_home)]
+                )
+            self.assertEqual(tools_result, 0)
+            self.assertIn("Tool call: shell_command", buffer.getvalue())
+
+    def test_find_regex_is_case_insensitive_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "88888888-8888-8888-8888-888888888888"
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "session_meta",
+                        "payload": {"id": session_id},
+                    },
+                    {
+                        "timestamp": "2026-04-30T18:20:50Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": "Need DADATA-SDK setup",
+                        },
+                    },
+                    {
+                        "timestamp": "2026-04-30T18:21:00Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "shell_command",
+                            "arguments": '{"command":"npm install DADATA-SDK"}',
+                        },
+                    },
+                ],
+            )
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(
+                    [
+                        "grep",
+                        "-i",
+                        "-r",
+                        "--line-width",
+                        "80",
+                        "dadata-[a-z]+",
+                        "--codex-home",
+                        str(codex_home),
+                    ]
+                )
+
+            output = buffer.getvalue()
+            self.assertEqual(result, 0)
+            self.assertIn("DADATA-SDK", output)
+            self.assertIn("NO ENTRY IN session_index.jsonl", output)
+
+    def test_find_truncates_long_matching_lines_with_multiple_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+            long_line = f"{'a' * 80} copy-as-markdown {'b' * 80} copy-as-markdown {'c' * 80}"
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": long_line,
+                        },
+                    }
+                ],
+            )
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(
+                    [
+                        "find",
+                        "--line-width",
+                        "90",
+                        "copy-as-markdown",
+                        "--codex-home",
+                        str(codex_home),
+                    ]
+                )
+
+            output = buffer.getvalue()
+            matching_lines = [line for line in output.splitlines() if "copy-as-markdown" in line]
+            self.assertEqual(result, 0)
+            self.assertEqual(len(matching_lines), 1)
+            self.assertLessEqual(len(matching_lines[0]), 92)
+            self.assertIn("...", matching_lines[0])
+            self.assertEqual(matching_lines[0].count("copy-as-markdown"), 2)
+
+    def test_find_uses_available_width_for_single_match_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+            long_line = f"{'a' * 100} copy-as-markdown {'b' * 100}"
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": long_line,
+                        },
+                    }
+                ],
+            )
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(
+                    [
+                        "find",
+                        "--line-width",
+                        "120",
+                        "copy-as-markdown",
+                        "--codex-home",
+                        str(codex_home),
+                    ]
+                )
+
+            output = buffer.getvalue()
+            matching_lines = [line for line in output.splitlines() if "copy-as-markdown" in line]
+            self.assertEqual(result, 0)
+            self.assertEqual(len(matching_lines), 1)
+            self.assertGreaterEqual(len(matching_lines[0]), 115)
+            self.assertLessEqual(len(matching_lines[0]), 122)
+
+    def test_find_summarizes_extra_matches_on_one_long_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+            long_line = (
+                "first useful context before copy-as-markdown "
+                + " filler text " * 8
+                + "second useful context before copy-as-markdown "
+                + " filler text " * 8
+                + "third copy-as-markdown fourth copy-as-markdown fifth copy-as-markdown"
+            )
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": long_line,
+                        },
+                    }
+                ],
+            )
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(
+                    [
+                        "find",
+                        "--line-width",
+                        "120",
+                        "copy-as-markdown",
+                        "--codex-home",
+                        str(codex_home),
+                    ]
+                )
+
+            output = buffer.getvalue()
+            matching_lines = [line for line in output.splitlines() if "more on line" in line]
+            self.assertEqual(result, 0)
+            self.assertEqual(len(matching_lines), 1)
+            self.assertLessEqual(len(matching_lines[0]), 122)
+            self.assertEqual(matching_lines[0].count("copy-as-markdown"), 1)
+            self.assertIn("(+4 more on line)", matching_lines[0])
+
+    def test_find_color_always_highlights_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "99999999-9999-9999-9999-999999999999"
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": "dadata-sdk",
+                        },
+                    }
+                ],
+            )
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(
+                    [
+                        "find",
+                        "--color",
+                        "always",
+                        "dadata-sdk",
+                        "--codex-home",
+                        str(codex_home),
+                    ]
+                )
+
+            output = buffer.getvalue()
+            self.assertEqual(result, 0)
+            self.assertIn("\x1b[", output)
+            self.assertIn("\x1b[1;91m", output)
+            self.assertIn("dadata-sdk", output)
+
+    def test_color_auto_forces_terminal_for_git_bash_pipe(self) -> None:
+        git_bash_env = {"TERM": "xterm-256color", "MSYSTEM": "MINGW64"}
+        with patch("codex_sessions_converter.converter.is_windows_pipe_stream", return_value=True):
+            self.assertEqual(
+                console_color_options("auto", StringIO(), git_bash_env),
+                (True, False),
+            )
+
+    def test_color_auto_does_not_force_for_git_bash_disk_redirect(self) -> None:
+        git_bash_env = {"TERM": "xterm-256color", "MSYSTEM": "MINGW64"}
+        with patch("codex_sessions_converter.converter.is_windows_pipe_stream", return_value=False):
+            self.assertEqual(
+                console_color_options("auto", StringIO(), git_bash_env),
+                (None, False),
+            )
+
+    def test_color_auto_honors_standard_color_environment_flags(self) -> None:
+        self.assertEqual(
+            console_color_options("auto", StringIO(), {"NO_COLOR": "1"}),
+            (None, True),
+        )
+        self.assertEqual(
+            console_color_options("auto", StringIO(), {"CLICOLOR": "0"}),
+            (None, True),
+        )
+        self.assertEqual(
+            console_color_options("auto", StringIO(), {"FORCE_COLOR": "1"}),
+            (True, False),
+        )
+
+    def test_find_returns_one_when_no_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            codex_home.joinpath("sessions").mkdir()
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(["find", "missing", "--codex-home", str(codex_home)])
+
+            self.assertEqual(result, 1)
+            self.assertEqual(buffer.getvalue(), "")
+
+    def test_find_limits_matching_lines_per_session_with_omission_note(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            records: list[dict[str, Any]] = [
+                {
+                    "timestamp": "2026-04-30T18:20:39Z",
+                    "type": "session_meta",
+                    "payload": {"id": session_id},
+                }
+            ]
+            for index in range(3):
+                records.append(
+                    {
+                        "timestamp": "2026-04-30T18:21:00Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": f"needle context {index}",
+                        },
+                    }
+                )
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                records,
+            )
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(
+                    [
+                        "find",
+                        "needle",
+                        "--max-lines-per-session",
+                        "2",
+                        "--codex-home",
+                        str(codex_home),
+                    ]
+                )
+
+            output = buffer.getvalue()
+            self.assertEqual(result, 0)
+            self.assertIn("needle context 0", output)
+            self.assertIn("needle context 1", output)
+            self.assertNotIn("needle context 2", output)
+            self.assertIn("+1 more occurrences", output)
 
     def test_encode_for_output_escapes_characters_unsupported_by_encoding(self) -> None:
         self.assertEqual(encode_for_output("Thread ✓", "cp1252"), r"Thread \u2713")

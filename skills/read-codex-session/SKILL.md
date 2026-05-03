@@ -34,17 +34,26 @@ The helper writes Markdown under `$CODEX_HOME/tmp/sessions/...` and prints the p
 
 ## Detail Levels
 
-Default helper output uses `--md-tools names`: visible dialogue plus tool names and call ids.
+Default helper output uses `--md-tools auto`: visible dialogue plus smart tool
+previews.
 
 Use a higher-detail pass only when needed:
 
 ```bash
+python ~/.codex/skills/read-codex-session/scripts/prepare_session_markdown.py <target> --md-tools names
+python ~/.codex/skills/read-codex-session/scripts/prepare_session_markdown.py <target> --md-tools smart
 python ~/.codex/skills/read-codex-session/scripts/prepare_session_markdown.py <target> --md-tools preview --preview-chars 1200
 python ~/.codex/skills/read-codex-session/scripts/prepare_session_markdown.py <target> --md-tools full
 python ~/.codex/skills/read-codex-session/scripts/prepare_session_markdown.py <target> --md-include metadata
 ```
 
 Use `--md-include metadata` when turn context, token counts, cwd, model, or rate-limit information matters.
+
+Base64 data images are truncated by default. Use `--md-images extract` when
+image content matters and the Markdown should link to real image files. Use
+`--md-images inline` only when the renderer must receive self-contained
+Markdown; inline image notes point back to `--md-images truncate` and
+`--md-images extract` for cleanup.
 
 Use `--format yaml` or the converter CLI directly only when the user asks for raw structured inspection.
 
@@ -53,8 +62,9 @@ Use `--format yaml` or the converter CLI directly only when the user asks for ra
 If the helper is unavailable, run `codex-sessions-converter` directly:
 
 ```bash
-codex-sessions-converter --md-tools names <rollout.jsonl> <output.md>
+codex-sessions-converter --md-tools smart <rollout.jsonl> <output.md>
 codex-sessions-converter --md-tools preview --md-tool-preview-chars 1200 <rollout.jsonl> <output.md>
+codex-sessions-converter --md-images extract <rollout.jsonl> <output.md>
 ```
 
 Avoid opening raw JSONL except for narrow targeted searches such as finding a missing record type.

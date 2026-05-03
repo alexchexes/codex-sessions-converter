@@ -9,6 +9,9 @@ description = "Convert Codex session rollout JSONL files to readable Markdown or
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
+dependencies = [
+  "rich>=14.1"
+]
 authors = [
   { name = "Alex" }
 ]

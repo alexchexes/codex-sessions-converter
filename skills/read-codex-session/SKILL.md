@@ -57,14 +57,30 @@ Markdown; inline image notes point back to `--md-images truncate` and
 
 Use `--format yaml` or the converter CLI directly only when the user asks for raw structured inspection.
 
-## Manual Fallback
+## Search
 
-If the helper is unavailable, run `codex-sessions-converter` directly:
+When the user asks to find a previous conversation by topic or phrase, prefer
+the converter search before raw `rg` over JSONL:
 
 ```bash
-codex-sessions-converter --md-tools smart <rollout.jsonl> <output.md>
-codex-sessions-converter --md-tools preview --md-tool-preview-chars 1200 <rollout.jsonl> <output.md>
-codex-sessions-converter --md-images extract <rollout.jsonl> <output.md>
+codex-sessions find -i "search phrase"
+codex-sessions find -i -r "regex|pattern"
+codex-sessions find --tools "shell command"
+codex-sessions find --metadata "repository-or-cwd"
+```
+
+`find` searches deserialized visible messages by default, highlights matches,
+and groups results by session. Use raw `rg` only for narrow file-format checks or
+when searching fields not covered by `find`.
+
+## Manual Fallback
+
+If the helper is unavailable, run `codex-sessions` directly:
+
+```bash
+codex-sessions --md-tools smart <rollout.jsonl> <output.md>
+codex-sessions --md-tools preview --md-tool-preview-chars 1200 <rollout.jsonl> <output.md>
+codex-sessions --md-images extract <rollout.jsonl> <output.md>
 ```
 
 Avoid opening raw JSONL except for narrow targeted searches such as finding a missing record type.

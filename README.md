@@ -53,28 +53,32 @@ python -m codex_sessions_converter --help
 
 ## Usage
 
+The installed short command is `codex-sessions`. The longer
+`codex-sessions-converter` command is also available for existing scripts and
+explicitness.
+
 Convert to YAML:
 
 ```bash
-codex-sessions-converter sessions/YYYY/MM/DD/rollout.jsonl rollout.yaml
+codex-sessions sessions/YYYY/MM/DD/rollout.jsonl rollout.yaml
 ```
 
 Use YAML explicitly:
 
 ```bash
-codex-sessions-converter --yaml sessions/YYYY/MM/DD/rollout.jsonl
+codex-sessions --yaml sessions/YYYY/MM/DD/rollout.jsonl
 ```
 
 Convert to Markdown:
 
 ```bash
-codex-sessions-converter sessions/YYYY/MM/DD/rollout.jsonl rollout.md
+codex-sessions sessions/YYYY/MM/DD/rollout.jsonl rollout.md
 ```
 
 Use Markdown explicitly when no `.md` output path is supplied:
 
 ```bash
-codex-sessions-converter --md sessions/YYYY/MM/DD/rollout.jsonl
+codex-sessions --md sessions/YYYY/MM/DD/rollout.jsonl
 ```
 
 The longer `--format md` form is also supported.
@@ -86,7 +90,7 @@ be found in the source JSONL. To write those images as real files next to the
 Markdown and link them from the document, use:
 
 ```bash
-codex-sessions-converter --md --md-images extract sessions/YYYY/MM/DD/rollout.jsonl
+codex-sessions --md --md-images extract sessions/YYYY/MM/DD/rollout.jsonl
 ```
 
 Extracted images are written to a sibling `<markdown-stem>_assets/` directory.
@@ -102,26 +106,26 @@ directory, not the current directory. Codex home defaults to `CODEX_HOME` or
 Convert by session ID:
 
 ```bash
-codex-sessions-converter 019dd5ce-19e1-78c3-9313-325228ddd983
+codex-sessions 019dd5ce-19e1-78c3-9313-325228ddd983
 ```
 
 Write an ID conversion to the current directory:
 
 ```bash
-codex-sessions-converter 019dd5ce-19e1-78c3-9313-325228ddd983 ./
+codex-sessions 019dd5ce-19e1-78c3-9313-325228ddd983 ./
 ```
 
 Use a specific Codex home directory for session ID lookup and default output:
 
 ```bash
-codex-sessions-converter --codex-home ~/.codex 019dd5ce-19e1-78c3-9313-325228ddd983
+codex-sessions --codex-home ~/.codex 019dd5ce-19e1-78c3-9313-325228ddd983
 ```
 
 List Codex sessions from `CODEX_HOME` or `~/.codex` and cross-check
 `session_index.jsonl` against actual session files:
 
 ```bash
-codex-sessions-converter list
+codex-sessions list
 ```
 
 Example output:
@@ -135,13 +139,13 @@ YYYY/MM/DD/rollout-....jsonl - NO ENTRY IN session_index.jsonl
 Use a specific Codex home directory:
 
 ```bash
-codex-sessions-converter list --codex-home ~/.codex
+codex-sessions list --codex-home ~/.codex
 ```
 
 Search all Codex sessions:
 
 ```bash
-codex-sessions-converter find -i "dadata-sdk"
+codex-sessions find -i "dadata-sdk"
 ```
 
 By default, `find` searches visible user and Codex messages only. Use
@@ -152,19 +156,19 @@ or `--all` to include both.
 `grep` is an alias for `find`:
 
 ```bash
-codex-sessions-converter grep -i "dadata-sdk"
+codex-sessions grep -i "dadata-sdk"
 ```
 
 Use regex mode with `-r`, `--regex`, or the grep-style `-E` alias:
 
 ```bash
-codex-sessions-converter find -i -r "dadata-[a-z]+"
+codex-sessions find -i -r "dadata-[a-z]+"
 ```
 
 Adjust the maximum width of each matching line:
 
 ```bash
-codex-sessions-converter find --line-width 220 "dadata-sdk"
+codex-sessions find --line-width 220 "dadata-sdk"
 ```
 
 By default, `find` shows up to 5 matching lines per session. Use `-m` or
@@ -203,35 +207,35 @@ context from an earlier conversation.
 
 ```bash
 # Visible user/Codex messages, reasoning, and progress messages.
-codex-sessions-converter --md-include dialogue input.jsonl output.md
+codex-sessions --md-include dialogue input.jsonl output.md
 
 # Default: dialogue plus concise tool call previews.
-codex-sessions-converter --md-include default input.jsonl output.md
+codex-sessions --md-include default input.jsonl output.md
 
 # Add metadata tables such as turn_context and token_count.
-codex-sessions-converter --md-include metadata input.jsonl output.md
+codex-sessions --md-include metadata input.jsonl output.md
 
 # Metadata plus raw unhandled records.
-codex-sessions-converter --md-include full input.jsonl output.md
+codex-sessions --md-include full input.jsonl output.md
 ```
 
 `--md-tools` controls tool call/output detail:
 
 ```bash
 # Tool names and call IDs only.
-codex-sessions-converter --md-tools names input.jsonl output.md
+codex-sessions --md-tools names input.jsonl output.md
 
 # Useful previews for known tool calls; unknown tools fall back to names.
-codex-sessions-converter --md-tools smart input.jsonl output.md
+codex-sessions --md-tools smart input.jsonl output.md
 
 # Tool names plus truncated arguments and outputs.
-codex-sessions-converter --md-tools preview input.jsonl output.md
+codex-sessions --md-tools preview input.jsonl output.md
 
 # Tune preview length.
-codex-sessions-converter --md-tools preview --md-tool-preview-chars 1200 input.jsonl output.md
+codex-sessions --md-tools preview --md-tool-preview-chars 1200 input.jsonl output.md
 
 # Hide tools entirely.
-codex-sessions-converter --md-tools none input.jsonl output.md
+codex-sessions --md-tools none input.jsonl output.md
 ```
 
 The default `--md-tools auto` follows `--md-include`: presets that include tools

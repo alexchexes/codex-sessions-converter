@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from codex_sessions_converter.converter import (  # noqa: E402
     MarkdownOptions,
+    cli_prog_from_argv0,
     console_color_options,
     convert_jsonl_to_markdown,
     convert_jsonl_to_yaml_stream,
@@ -39,6 +40,23 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 class ConverterTests(unittest.TestCase):
+    def test_short_cli_entry_point_is_configured(self) -> None:
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+        self.assertIn('codex-sessions = "codex_sessions_converter.converter:main"', pyproject)
+        self.assertIn(
+            'codex-sessions-converter = "codex_sessions_converter.converter:main"',
+            pyproject,
+        )
+
+    def test_cli_prog_prefers_short_name(self) -> None:
+        self.assertEqual(cli_prog_from_argv0("codex-sessions.exe"), "codex-sessions")
+        self.assertEqual(
+            cli_prog_from_argv0("codex-sessions-converter.exe"),
+            "codex-sessions-converter",
+        )
+        self.assertEqual(cli_prog_from_argv0("converter.py"), "codex-sessions")
+
     def test_yaml_conversion_redacts_encrypted_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_path = Path(tmpdir) / "rollout.jsonl"

@@ -52,6 +52,8 @@ MARKDOWN_PRESETS = {
     "metadata": {"tools", "metadata"},
     "full": {"tools", "metadata", "raw"},
 }
+DEFAULT_CLI_PROG = "codex-sessions"
+CLI_PROG_ALIASES = {DEFAULT_CLI_PROG, "codex-sessions-converter"}
 MARKDOWN_INCLUDE_ALIASES = {
     "all": "all",
     "none": "none",
@@ -131,6 +133,13 @@ class CliError(Exception):
     pass
 
 
+def cli_prog_from_argv0(argv0: str | None = None) -> str:
+    stem = Path(sys.argv[0] if argv0 is None else argv0).stem
+    if stem in CLI_PROG_ALIASES:
+        return stem
+    return DEFAULT_CLI_PROG
+
+
 def default_codex_home() -> Path:
     configured = os.environ.get("CODEX_HOME")
     if configured:
@@ -138,9 +147,11 @@ def default_codex_home() -> Path:
     return Path.home() / ".codex"
 
 
-def parse_list_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+def parse_list_args(
+    argv: Sequence[str] | None = None, prog: str = DEFAULT_CLI_PROG
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="codex-sessions-converter list",
+        prog=f"{prog} list",
         description=(
             "List Codex sessions and cross-check session_index.jsonl against rollout JSONL files."
         ),
@@ -164,9 +175,11 @@ def parse_list_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def parse_search_args(command: str, argv: Sequence[str] | None = None) -> argparse.Namespace:
+def parse_search_args(
+    command: str, argv: Sequence[str] | None = None, prog: str = DEFAULT_CLI_PROG
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog=f"codex-sessions-converter {command}",
+        prog=f"{prog} {command}",
         description="Search Codex session rollout JSONL files.",
     )
     parser.add_argument("pattern", help="Text or regex pattern to search for.")
@@ -245,9 +258,11 @@ def parse_search_args(command: str, argv: Sequence[str] | None = None) -> argpar
     return parser.parse_args(argv)
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: Sequence[str] | None = None, prog: str = DEFAULT_CLI_PROG
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="codex-sessions-converter",
+        prog=prog,
         description="Convert Codex session rollout JSONL files to YAML or Markdown.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -2380,12 +2395,13 @@ def run_search_command(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    prog = cli_prog_from_argv0()
     if raw_argv[:1] == ["list"]:
-        return run_list_command(parse_list_args(raw_argv[1:]))
+        return run_list_command(parse_list_args(raw_argv[1:], prog))
     if raw_argv[:1] in (["find"], ["grep"]):
-        return run_search_command(parse_search_args(raw_argv[0], raw_argv[1:]))
+        return run_search_command(parse_search_args(raw_argv[0], raw_argv[1:], prog))
 
-    args = parse_args(raw_argv)
+    args = parse_args(raw_argv, prog)
     codex_home = args.codex_home.expanduser().resolve()
     try:
         markdown_features = parse_markdown_include(args.md_include)

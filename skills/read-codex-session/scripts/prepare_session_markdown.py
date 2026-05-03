@@ -130,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--md-include",
         default="default",
-        help="Markdown include preset/modifiers passed to codex-sessions-converter.",
+        help="Markdown include preset/modifiers passed to codex-sessions.",
     )
     parser.add_argument(
         "--md-tools",
@@ -152,8 +152,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--converter",
-        default="codex-sessions-converter",
-        help="Converter command name/path. Default: codex-sessions-converter.",
+        default="codex-sessions",
+        help="Converter command name/path. Default: codex-sessions.",
     )
     return parser.parse_args()
 

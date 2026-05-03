@@ -30,6 +30,8 @@ NO_SESSION_INDEX_ENTRY = "NO ENTRY IN session_index.jsonl"
 MARKDOWN_FEATURES = {"tools", "metadata", "raw"}
 MARKDOWN_TOOL_MODES = {"auto", "none", "names", "smart", "preview", "full"}
 MARKDOWN_IMAGE_MODES = {"truncate", "extract", "inline"}
+SEARCH_CACHE_VERSION = 1
+SEARCH_CACHE_RELATIVE_PATH = Path("cache") / "codex-sessions" / "search-v1.json"
 DEFAULT_TOOL_PREVIEW_CHARS = 700
 DATA_IMAGE_PREFIX_CHARS = 24
 MAX_MATCHES_BEFORE_LINE_OMISSION = 2
@@ -127,6 +129,16 @@ class SearchResult:
     session_info: str
     lines: tuple[SearchLine, ...]
     omitted_occurrence_count: int
+
+
+@dataclass(frozen=True)
+class SearchDocument:
+    session_id: str | None
+    started_at: datetime | None
+    ended_at: datetime | None
+    visible_lines: tuple[str, ...]
+    metadata_lines: tuple[str, ...]
+    tool_lines: tuple[str, ...]
 
 
 class CliError(Exception):
@@ -254,6 +266,16 @@ def parse_search_args(
         "--redact-encrypted",
         default="...",
         help="Replacement text for any encrypted_content field.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Do not read or write the extracted search text cache.",
+    )
+    parser.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Ignore existing cached search text and rewrite cache entries.",
     )
     return parser.parse_args(argv)
 
@@ -779,25 +801,76 @@ def session_search_text(input_path: Path, options: SearchOptions) -> str:
 
 
 def session_search_lines(input_path: Path, options: SearchOptions) -> list[str]:
-    lines = []
+    document = build_search_document(input_path, options.redaction)
+    return search_document_lines(document, options)
+
+
+def search_document_lines(document: SearchDocument, options: SearchOptions) -> list[str]:
+    lines: list[str] = []
     seen_lines = set()
-    for _, raw_record in iter_jsonl_objects(input_path):
-        record = sanitize(raw_record, options.redaction)
-        for line in render_search_lines(record, options):
+    line_groups = [document.visible_lines]
+    if options.include_metadata:
+        line_groups.append(document.metadata_lines)
+    if options.include_tools:
+        line_groups.append(document.tool_lines)
+
+    for group in line_groups:
+        for line in group:
             if line and line not in seen_lines:
                 seen_lines.add(line)
                 lines.append(line)
     return lines
 
 
-def render_search_lines(record: dict[str, Any], options: SearchOptions) -> list[str]:
+def build_search_document(input_path: Path, redaction: str) -> SearchDocument:
+    session_id = session_id_from_path(input_path)
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    line_groups: dict[str, list[str]] = {"visible": [], "metadata": [], "tools": []}
+    seen_lines: dict[str, set[str]] = {"visible": set(), "metadata": set(), "tools": set()}
+
+    for _, raw_record in iter_jsonl_objects(input_path):
+        record_timestamp = parse_timestamp(raw_record.get("timestamp"))
+        if record_timestamp is not None:
+            ended_at = record_timestamp
+
+        payload = raw_record.get("payload")
+        if started_at is None:
+            started_at = record_timestamp
+            if started_at is None and isinstance(payload, dict):
+                started_at = parse_timestamp(payload.get("timestamp"))
+        if (
+            session_id is None
+            and raw_record.get("type") == "session_meta"
+            and isinstance(payload, dict)
+        ):
+            payload_id = payload.get("id")
+            if isinstance(payload_id, str) and payload_id:
+                session_id = payload_id
+
+        record = sanitize(raw_record, redaction)
+        for group, lines in render_search_line_groups(record):
+            for line in lines:
+                if line and line not in seen_lines[group]:
+                    seen_lines[group].add(line)
+                    line_groups[group].append(line)
+
+    return SearchDocument(
+        session_id=session_id,
+        started_at=started_at,
+        ended_at=ended_at,
+        visible_lines=tuple(line_groups["visible"]),
+        metadata_lines=tuple(line_groups["metadata"]),
+        tool_lines=tuple(line_groups["tools"]),
+    )
+
+
+def render_search_line_groups(record: dict[str, Any]) -> list[tuple[str, list[str]]]:
     record_type = record.get("type")
     payload = record.get("payload")
 
     if record_type == "session_meta" and isinstance(payload, dict):
-        if not options.include_metadata:
-            return []
-        return render_session_metadata_search_lines(payload)
+        return [("metadata", render_session_metadata_search_lines(payload))]
 
     if record_type == "response_item" and isinstance(payload, dict):
         payload_type = payload.get("type")
@@ -805,26 +878,35 @@ def render_search_lines(record: dict[str, Any], options: SearchOptions) -> list[
             role = payload.get("role")
             text = content_to_text(payload.get("content"))
             if role == "assistant":
-                return render_labeled_search_lines("Codex", text)
+                return [("visible", render_labeled_search_lines("Codex", text))]
             if role == "user" and not is_injected_user_context(text):
-                return render_labeled_search_lines("User", text)
+                return [("visible", render_labeled_search_lines("User", text))]
             return []
         if payload_type == "reasoning":
             return []
         if payload_type in {"function_call", "tool_search_call", "custom_tool_call"}:
-            if not options.include_tools:
-                return []
-            return render_tool_call_search_lines(payload)
+            return [("tools", render_tool_call_search_lines(payload))]
         return []
 
     if record_type == "event_msg" and isinstance(payload, dict):
         payload_type = payload.get("type")
         if payload_type == "user_message":
-            return render_labeled_search_lines("User", payload.get("message", ""))
+            return [("visible", render_labeled_search_lines("User", payload.get("message", "")))]
         if payload_type == "agent_message":
-            return render_labeled_search_lines("Codex", payload.get("message", ""))
+            return [("visible", render_labeled_search_lines("Codex", payload.get("message", "")))]
 
     return []
+
+
+def render_search_lines(record: dict[str, Any], options: SearchOptions) -> list[str]:
+    lines = []
+    for group, group_lines in render_search_line_groups(record):
+        if group == "metadata" and not options.include_metadata:
+            continue
+        if group == "tools" and not options.include_tools:
+            continue
+        lines.extend(group_lines)
+    return lines
 
 
 def render_labeled_search_lines(label: str, text: str) -> list[str]:
@@ -1093,11 +1175,145 @@ def centered_match_snippet(
     return snippet, snippet_matches
 
 
+def search_cache_path(codex_home: Path) -> Path:
+    return codex_home / SEARCH_CACHE_RELATIVE_PATH
+
+
+def search_cache_key(path: Path) -> str:
+    return os.path.normcase(str(path.resolve()))
+
+
+def read_search_cache(cache_path: Path) -> dict[str, Any]:
+    try:
+        raw_cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(raw_cache, dict):
+        return {}
+    if raw_cache.get("version") != SEARCH_CACHE_VERSION:
+        return {}
+    entries = raw_cache.get("entries")
+    if not isinstance(entries, dict):
+        return {}
+    return entries
+
+
+def write_search_cache(cache_path: Path, entries: Mapping[str, Any]) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+    cache_data = {
+        "version": SEARCH_CACHE_VERSION,
+        "entries": entries,
+    }
+    temp_path.write_text(
+        json.dumps(cache_data, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    temp_path.replace(cache_path)
+
+
+def cached_search_document(
+    entry: Any, path: Path, stat_result: os.stat_result, redaction: str
+) -> SearchDocument | None:
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("path") != str(path.resolve()):
+        return None
+    if entry.get("size") != stat_result.st_size:
+        return None
+    if entry.get("mtime_ns") != stat_result.st_mtime_ns:
+        return None
+    if entry.get("redaction") != redaction:
+        return None
+
+    visible_lines = string_tuple(entry.get("visible_lines"))
+    metadata_lines = string_tuple(entry.get("metadata_lines"))
+    tool_lines = string_tuple(entry.get("tool_lines"))
+    if visible_lines is None or metadata_lines is None or tool_lines is None:
+        return None
+
+    session_id = entry.get("session_id")
+    if session_id is not None and not isinstance(session_id, str):
+        return None
+
+    return SearchDocument(
+        session_id=session_id,
+        started_at=parse_timestamp(entry.get("started_at")),
+        ended_at=parse_timestamp(entry.get("ended_at")),
+        visible_lines=visible_lines,
+        metadata_lines=metadata_lines,
+        tool_lines=tool_lines,
+    )
+
+
+def string_tuple(value: Any) -> tuple[str, ...] | None:
+    if not isinstance(value, list):
+        return None
+    if not all(isinstance(item, str) for item in value):
+        return None
+    return tuple(value)
+
+
+def search_cache_entry(
+    path: Path, stat_result: os.stat_result, document: SearchDocument, redaction: str
+) -> dict[str, Any]:
+    return {
+        "path": str(path.resolve()),
+        "size": stat_result.st_size,
+        "mtime_ns": stat_result.st_mtime_ns,
+        "redaction": redaction,
+        "session_id": document.session_id,
+        "started_at": document.started_at.isoformat() if document.started_at else None,
+        "ended_at": document.ended_at.isoformat() if document.ended_at else None,
+        "visible_lines": list(document.visible_lines),
+        "metadata_lines": list(document.metadata_lines),
+        "tool_lines": list(document.tool_lines),
+    }
+
+
+def prune_missing_search_cache_entries(entries: dict[str, Any]) -> bool:
+    removed_any = False
+    for key, entry in list(entries.items()):
+        path_text = entry.get("path") if isinstance(entry, dict) else None
+        if not isinstance(path_text, str):
+            del entries[key]
+            removed_any = True
+            continue
+        if not Path(path_text).exists():
+            del entries[key]
+            removed_any = True
+    return removed_any
+
+
+def search_document_for_file(
+    path: Path,
+    redaction: str,
+    cache_entries: dict[str, Any] | None,
+    *,
+    rebuild_cache: bool,
+) -> tuple[SearchDocument, os.stat_result, bool]:
+    stat_result = path.stat()
+    cache_key = search_cache_key(path)
+    if cache_entries is not None and not rebuild_cache:
+        document = cached_search_document(
+            cache_entries.get(cache_key), path, stat_result, redaction
+        )
+        if document is not None:
+            return document, stat_result, False
+
+    document = build_search_document(path, redaction)
+    return document, stat_result, True
+
+
 def search_sessions(
     codex_home: Path,
     options: SearchOptions,
     session_index_path: Path | None = None,
     sessions_dir: Path | None = None,
+    *,
+    use_cache: bool = True,
+    rebuild_cache: bool = False,
 ) -> tuple[list[SearchResult], list[str]]:
     resolved_sessions_dir = sessions_dir or codex_home / "sessions"
     if not resolved_sessions_dir.exists():
@@ -1106,16 +1322,36 @@ def search_sessions(
     index_path = session_index_path or codex_home / "session_index.jsonl"
     index_entries = read_session_index(index_path)
     entries_by_id = {normalize_session_id(entry.session_id): entry for entry in index_entries}
-    session_files = discover_session_files(resolved_sessions_dir, include_ended_at=True)
     search_pattern = compile_search_pattern(options)
+    session_paths = sorted(
+        candidate for candidate in resolved_sessions_dir.rglob("*.jsonl") if candidate.is_file()
+    )
+    cache_path = search_cache_path(codex_home)
+    cache_entries = read_search_cache(cache_path) if use_cache else None
+    cache_dirty = False
 
     results = []
     warnings = []
-    for session_file in session_files:
+    for session_path in session_paths:
         try:
-            search_lines = session_search_lines(session_file.path, options)
+            document, stat_result, document_rebuilt = search_document_for_file(
+                session_path,
+                options.redaction,
+                cache_entries,
+                rebuild_cache=rebuild_cache,
+            )
+            if cache_entries is not None and document_rebuilt:
+                cache_entries[search_cache_key(session_path)] = search_cache_entry(
+                    session_path, stat_result, document, options.redaction
+                )
+                cache_dirty = True
+            search_lines = search_document_lines(document, options)
         except (OSError, ValueError) as exc:
-            warnings.append(f"{session_file.relative_path}: {exc}")
+            relative_path = format_session_file_path(session_path, resolved_sessions_dir)
+            warnings.append(f"{relative_path}: {exc}")
+            if cache_entries is not None:
+                cache_entries.pop(search_cache_key(session_path), None)
+                cache_dirty = True
             continue
 
         all_lines = search_matching_lines(search_lines, search_pattern, options.line_width)
@@ -1131,6 +1367,13 @@ def search_sessions(
             omitted_occurrence_count = 0
 
         if lines:
+            session_file = SessionFile(
+                path=session_path,
+                relative_path=format_session_file_path(session_path, resolved_sessions_dir),
+                session_id=document.session_id,
+                started_at=document.started_at,
+                ended_at=document.ended_at,
+            )
             results.append(
                 SearchResult(
                     session_info=session_info_for_search(session_file, entries_by_id),
@@ -1138,6 +1381,14 @@ def search_sessions(
                     omitted_occurrence_count=omitted_occurrence_count,
                 )
             )
+
+    if cache_entries is not None:
+        cache_dirty = prune_missing_search_cache_entries(cache_entries) or cache_dirty
+        if cache_dirty:
+            try:
+                write_search_cache(cache_path, cache_entries)
+            except OSError as exc:
+                warnings.append(f"Could not write search cache {cache_path}: {exc}")
 
     return results, warnings
 
@@ -2380,6 +2631,8 @@ def run_search_command(args: argparse.Namespace) -> int:
             options=options,
             session_index_path=session_index_path,
             sessions_dir=sessions_dir,
+            use_cache=not args.no_cache,
+            rebuild_cache=args.rebuild_cache,
         )
     except (CliError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

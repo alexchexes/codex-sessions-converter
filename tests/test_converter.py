@@ -29,6 +29,7 @@ from codex_sessions_converter.converter import (  # noqa: E402
     render_reasoning,
     resolve_markdown_tool_mode,
     resolve_output_path,
+    search_cache_path,
 )
 
 
@@ -1313,6 +1314,124 @@ class ConverterTests(unittest.TestCase):
 
             self.assertEqual(result, 1)
             self.assertEqual(buffer.getvalue(), "")
+
+    def test_find_reuses_cached_search_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": "cached needle",
+                        },
+                    }
+                ],
+            )
+
+            with redirect_stdout(StringIO()):
+                first_result = main(["find", "needle", "--codex-home", str(codex_home)])
+            self.assertEqual(first_result, 0)
+            self.assertTrue(search_cache_path(codex_home).exists())
+
+            with patch(
+                "codex_sessions_converter.converter.iter_jsonl_objects",
+                side_effect=AssertionError("cache should avoid reparsing rollout JSONL"),
+            ):
+                buffer = StringIO()
+                with redirect_stdout(buffer):
+                    second_result = main(["find", "needle", "--codex-home", str(codex_home)])
+
+            self.assertEqual(second_result, 0)
+            self.assertIn("cached needle", buffer.getvalue())
+
+    def test_find_invalidates_cache_when_rollout_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+            session_path = sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl"
+            write_jsonl(
+                session_path,
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": "old needle",
+                        },
+                    }
+                ],
+            )
+
+            with redirect_stdout(StringIO()):
+                first_result = main(["find", "needle", "--codex-home", str(codex_home)])
+            self.assertEqual(first_result, 0)
+
+            write_jsonl(
+                session_path,
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": "new replacement text",
+                        },
+                    }
+                ],
+            )
+
+            with redirect_stdout(StringIO()):
+                old_result = main(["find", "needle", "--codex-home", str(codex_home)])
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                new_result = main(["find", "replacement", "--codex-home", str(codex_home)])
+
+            self.assertEqual(old_result, 1)
+            self.assertEqual(new_result, 0)
+            self.assertIn("new replacement text", buffer.getvalue())
+
+    def test_find_no_cache_does_not_write_search_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir)
+            sessions_day = codex_home / "sessions" / "2026" / "04" / "30"
+            sessions_day.mkdir(parents=True)
+
+            session_id = "abababab-abab-abab-abab-abababababab"
+            write_jsonl(
+                sessions_day / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": "uncached needle",
+                        },
+                    }
+                ],
+            )
+
+            with redirect_stdout(StringIO()):
+                result = main(["find", "--no-cache", "needle", "--codex-home", str(codex_home)])
+
+            self.assertEqual(result, 0)
+            self.assertFalse(search_cache_path(codex_home).exists())
 
     def test_find_limits_matching_lines_per_session_with_omission_note(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -70,8 +70,9 @@ codex-sessions find --metadata "repository-or-cwd"
 ```
 
 `find` searches deserialized visible messages by default, highlights matches,
-and groups results by session. Use raw `rg` only for narrow file-format checks or
-when searching fields not covered by `find`.
+groups results by session, and caches extracted text under
+`$CODEX_HOME/cache/codex-sessions/`. Use raw `rg` only for narrow file-format
+checks or when searching fields not covered by `find`.
 
 ## Manual Fallback
 

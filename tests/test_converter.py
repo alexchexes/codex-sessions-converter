@@ -40,6 +40,10 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     )
 
 
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
 class ConverterTests(unittest.TestCase):
     def test_short_cli_entry_point_is_configured(self) -> None:
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -1543,6 +1547,266 @@ class ConverterTests(unittest.TestCase):
             self.assertEqual(
                 list(codex_home.glob("backups/codex-sessions/*/session_index.jsonl")),
                 [],
+            )
+
+    def test_import_dry_run_reports_plan_without_modifying_codex_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            codex_home = root / "codex"
+            source_dir = root / "incoming"
+            source_dir.mkdir()
+            session_id = "17171717-1717-1717-1717-171717171717"
+            source_path = source_dir / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl"
+            write_jsonl(
+                source_path,
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "thread_name_updated",
+                            "thread_id": session_id,
+                            "thread_name": "Import dry run title",
+                        },
+                    }
+                ],
+            )
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(
+                    ["import", "--dry-run", "--codex-home", str(codex_home), str(source_path)]
+                )
+
+            output = buffer.getvalue()
+            target_path = codex_home / "sessions" / "2026" / "04" / "30" / source_path.name
+            self.assertEqual(result, 0)
+            self.assertIn(f"Session: {session_id} - Import dry run title", output)
+            self.assertIn(f"Target rollout: {target_path}", output)
+            self.assertIn("Index action: add session_index.jsonl entry", output)
+            self.assertIn("Rollout action: copy unchanged", output)
+            self.assertIn("Source fingerprint:", output)
+            self.assertFalse(target_path.exists())
+            self.assertFalse((codex_home / "session_index.jsonl").exists())
+
+    def test_import_bare_rollout_adds_index_copies_rollout_and_resets_state_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            source_dir = root / "incoming"
+            source_dir.mkdir()
+            session_id = "18181818-1818-1818-1818-181818181818"
+            source_path = source_dir / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl"
+            records = [
+                {
+                    "timestamp": "2026-04-30T18:20:39Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_name_updated",
+                        "thread_id": session_id,
+                        "thread_name": "Imported title",
+                    },
+                },
+                {
+                    "timestamp": "2026-04-30T18:21:39Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": "Imported body",
+                    },
+                },
+            ]
+            write_jsonl(source_path, records)
+            state_db = codex_home / "state_5.sqlite"
+            state_db.write_text("state", encoding="utf-8")
+
+            buffer = StringIO()
+            with redirect_stdout(buffer):
+                result = main(["import", "--codex-home", str(codex_home), str(source_path)])
+
+            output = buffer.getvalue()
+            target_path = codex_home / "sessions" / "2026" / "04" / "30" / source_path.name
+            index_records = read_jsonl(codex_home / "session_index.jsonl")
+            backup_dirs = sorted((codex_home / "backups" / "codex-sessions").iterdir())
+            self.assertEqual(result, 0)
+            self.assertIn(f"Imported session: {session_id} - Imported title", output)
+            self.assertIn("Index action: add session_index.jsonl entry", output)
+            self.assertIn("State cache backups:", output)
+            self.assertEqual(
+                target_path.read_text(encoding="utf-8"), source_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                index_records,
+                [
+                    {
+                        "id": session_id,
+                        "thread_name": "Imported title",
+                        "updated_at": "2026-04-30T18:21:39Z",
+                    }
+                ],
+            )
+            self.assertFalse(state_db.exists())
+            self.assertEqual(len(backup_dirs), 1)
+            self.assertEqual(
+                (backup_dirs[0] / "state_5.sqlite").read_text(encoding="utf-8"), "state"
+            )
+
+    def test_import_inserts_rollout_title_event_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            codex_home = root / "codex"
+            source_dir = root / "incoming"
+            source_dir.mkdir()
+            session_id = "19191919-1919-1919-1919-191919191919"
+            source_path = source_dir / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl"
+            write_jsonl(
+                source_path,
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "session_meta",
+                        "payload": {"id": session_id},
+                    },
+                    {
+                        "timestamp": "2026-04-30T18:21:39Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": "Infer this imported title. More body.",
+                        },
+                    },
+                ],
+            )
+
+            with redirect_stdout(StringIO()):
+                result = main(["import", "--codex-home", str(codex_home), str(source_path)])
+
+            target_path = codex_home / "sessions" / "2026" / "04" / "30" / source_path.name
+            rollout_records = read_jsonl(target_path)
+            index_records = read_jsonl(codex_home / "session_index.jsonl")
+            self.assertEqual(result, 0)
+            self.assertEqual(rollout_records[0]["type"], "session_meta")
+            self.assertEqual(rollout_records[1]["type"], "event_msg")
+            self.assertEqual(rollout_records[1]["timestamp"], "2026-04-30T18:20:39Z")
+            self.assertEqual(
+                rollout_records[1]["payload"]["thread_name"], "Infer this imported title."
+            )
+            self.assertEqual(index_records[0]["thread_name"], "Infer this imported title.")
+
+    def test_import_refuses_identical_existing_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            codex_home = root / "codex"
+            source_dir = root / "incoming"
+            source_dir.mkdir()
+            session_id = "20202020-2020-2020-2020-202020202020"
+            filename = f"rollout-2026-04-30T18-20-39-{session_id}.jsonl"
+            source_path = source_dir / filename
+            target_path = codex_home / "sessions" / "2026" / "04" / "30" / filename
+            target_path.parent.mkdir(parents=True)
+            records = [
+                {
+                    "timestamp": "2026-04-30T18:20:39Z",
+                    "type": "session_meta",
+                    "payload": {"id": session_id},
+                }
+            ]
+            write_jsonl(source_path, records)
+            write_jsonl(target_path, records)
+
+            with self.assertRaises(SystemExit) as raised:
+                main(["import", "--codex-home", str(codex_home), str(source_path)])
+
+            self.assertIn("already imported with identical rollout file", str(raised.exception))
+            self.assertIn("sha256", str(raised.exception))
+
+    def test_import_refuses_different_existing_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            codex_home = root / "codex"
+            source_dir = root / "incoming"
+            source_dir.mkdir()
+            session_id = "21212121-2121-2121-2121-212121212121"
+            filename = f"rollout-2026-04-30T18-20-39-{session_id}.jsonl"
+            source_path = source_dir / filename
+            target_path = codex_home / "sessions" / "2026" / "04" / "30" / filename
+            target_path.parent.mkdir(parents=True)
+            write_jsonl(
+                source_path,
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "session_meta",
+                        "payload": {"id": session_id},
+                    }
+                ],
+            )
+            write_jsonl(
+                target_path,
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "session_meta",
+                        "payload": {"id": session_id},
+                    },
+                    {
+                        "timestamp": "2026-04-30T18:21:39Z",
+                        "type": "response_item",
+                        "payload": {"type": "message", "role": "user", "content": "different"},
+                    },
+                ],
+            )
+
+            with self.assertRaises(SystemExit) as raised:
+                main(["import", "--codex-home", str(codex_home), str(source_path)])
+
+            message = str(raised.exception)
+            self.assertIn("already imported, but rollout file differs", message)
+            self.assertIn("Existing:", message)
+            self.assertIn("import:", message)
+            self.assertIn("sha256", message)
+
+    def test_import_existing_index_without_rollout_uses_existing_index_title(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            source_dir = root / "incoming"
+            source_dir.mkdir()
+            session_id = "22222222-2222-2222-2222-222222222222"
+            source_path = source_dir / f"rollout-2026-04-30T18-20-39-{session_id}.jsonl"
+            write_jsonl(
+                codex_home / "session_index.jsonl",
+                [{"id": session_id, "thread_name": "Existing index title"}],
+            )
+            write_jsonl(
+                source_path,
+                [
+                    {
+                        "timestamp": "2026-04-30T18:20:39Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "thread_name_updated",
+                            "thread_id": session_id,
+                            "thread_name": "Source rollout title",
+                        },
+                    }
+                ],
+            )
+
+            with redirect_stdout(StringIO()):
+                result = main(["import", "--codex-home", str(codex_home), str(source_path)])
+
+            target_path = codex_home / "sessions" / "2026" / "04" / "30" / source_path.name
+            rollout_records = read_jsonl(target_path)
+            index_records = read_jsonl(codex_home / "session_index.jsonl")
+            self.assertEqual(result, 0)
+            self.assertEqual(rollout_records[0]["payload"]["thread_name"], "Existing index title")
+            self.assertEqual(
+                index_records, [{"id": session_id, "thread_name": "Existing index title"}]
             )
 
     def test_find_searches_deserialized_text_and_groups_by_session(self) -> None:

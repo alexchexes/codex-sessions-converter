@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -53,6 +54,7 @@ MAX_VISIBLE_MATCHES_PER_OMITTED_LINE = 1
 MAX_INFERRED_TITLE_CHARS = 80
 MAX_INFERRED_TITLE_WORDS = 12
 DATA_IMAGE_URL_RE = re.compile(r"^data:(image/[A-Za-z0-9.+-]+);base64,(.*)$", re.DOTALL)
+ROLLOUT_FILENAME_DATE_RE = re.compile(r"^rollout-(\d{4})-(\d{2})-(\d{2})T")
 IMAGE_EXTENSION_BY_MIME_TYPE = {
     "image/png": "png",
     "image/jpeg": "jpg",
@@ -186,6 +188,34 @@ class RenameSessionResult:
     rollout_backup_path: Path | None
     rollout_thread_name: str | None
     changed: bool
+    session_index_backup_path: Path | None
+    state_cache_backups: tuple[StateCacheBackup, ...]
+
+
+@dataclass(frozen=True)
+class FileFingerprint:
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ImportSessionPlan:
+    source_path: Path
+    target_path: Path
+    session_index_path: Path
+    session_id: str
+    thread_name: str
+    started_at: datetime | None
+    ended_at: datetime | None
+    index_action: str
+    existing_index_thread_name: str | None
+    source_fingerprint: FileFingerprint
+    rollout_will_be_rewritten: bool
+
+
+@dataclass(frozen=True)
+class ImportSessionResult:
+    plan: ImportSessionPlan
     session_index_backup_path: Path | None
     state_cache_backups: tuple[StateCacheBackup, ...]
 
@@ -403,6 +433,44 @@ def parse_rename_args(
     return parser.parse_args(argv)
 
 
+def parse_import_args(
+    argv: Sequence[str] | None = None, prog: str = DEFAULT_CLI_PROG
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog=f"{prog} import",
+        description="Import a bare Codex rollout JSONL file into Codex home.",
+    )
+    parser.add_argument("input", type=Path, help="Path to a rollout JSONL file.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the import plan without modifying Codex state.",
+    )
+    parser.add_argument(
+        "--name",
+        "--rename",
+        dest="name",
+        help="Title to use for the imported session.",
+    )
+    parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=default_codex_home(),
+        help="Codex home directory. Defaults to CODEX_HOME or ~/.codex.",
+    )
+    parser.add_argument(
+        "--session-index",
+        type=Path,
+        help="Path to session_index.jsonl. Defaults to <codex-home>/session_index.jsonl.",
+    )
+    parser.add_argument(
+        "--sessions-dir",
+        type=Path,
+        help="Path to Codex sessions directory. Defaults to <codex-home>/sessions.",
+    )
+    return parser.parse_args(argv)
+
+
 def parse_args(
     argv: Sequence[str] | None = None, prog: str = DEFAULT_CLI_PROG
 ) -> argparse.Namespace:
@@ -418,6 +486,7 @@ def parse_args(
             "  repair-index\n"
             "             inspect missing session_index.jsonl entries\n\n"
             "  rename     rename a session_index.jsonl entry\n\n"
+            "  import     import a bare rollout JSONL file\n\n"
             "Markdown include presets:\n"
             "  dialogue   visible user/Codex messages, reasoning, progress messages\n"
             "  default    dialogue plus tool calls and tool outputs\n"
@@ -1156,6 +1225,287 @@ def inferred_thread_name(document: SearchDocument) -> str:
     if document.session_id is None:
         return "Imported session"
     return infer_search_document_title(document) or fallback_thread_name(document.session_id)
+
+
+def file_fingerprint(path: Path) -> FileFingerprint:
+    digest = hashlib.sha256()
+    with path.open("rb") as src:
+        while chunk := src.read(1024 * 1024):
+            digest.update(chunk)
+    return FileFingerprint(size=path.stat().st_size, sha256=digest.hexdigest())
+
+
+def short_sha256(fingerprint: FileFingerprint | None) -> str:
+    return fingerprint.sha256[:12] if fingerprint is not None else "UNKNOWN"
+
+
+def rollout_filename_date(path: Path) -> tuple[str, str, str] | None:
+    match = ROLLOUT_FILENAME_DATE_RE.match(path.name)
+    if not match:
+        return None
+    return match.group(1), match.group(2), match.group(3)
+
+
+def import_target_date(source_path: Path, document: SearchDocument) -> tuple[str, str, str]:
+    filename_date = rollout_filename_date(source_path)
+    if filename_date is not None:
+        return filename_date
+    if document.started_at is None:
+        raise CliError(
+            f"Cannot infer session date from rollout filename or timestamps: {source_path}"
+        )
+    local_started_at = document.started_at.astimezone()
+    return (
+        f"{local_started_at.year:04d}",
+        f"{local_started_at.month:02d}",
+        f"{local_started_at.day:02d}",
+    )
+
+
+def import_target_filename(source_path: Path, document: SearchDocument) -> str:
+    if document.session_id is None:
+        raise CliError(f"Cannot infer session id from rollout: {source_path}")
+    if source_path.name.startswith("rollout-") and session_id_from_path(source_path):
+        return source_path.name
+    if document.started_at is None:
+        raise CliError(
+            f"Cannot infer rollout filename from source name or timestamps: {source_path}"
+        )
+    local_started_at = document.started_at.astimezone()
+    timestamp = local_started_at.strftime("%Y-%m-%dT%H-%M-%S")
+    return f"rollout-{timestamp}-{document.session_id}.jsonl"
+
+
+def import_target_path(source_path: Path, sessions_dir: Path, document: SearchDocument) -> Path:
+    year, month, day = import_target_date(source_path, document)
+    return sessions_dir / year / month / day / import_target_filename(source_path, document)
+
+
+def existing_session_files_for_id(session_id: str, sessions_dir: Path) -> list[SessionFile]:
+    normalized_id = normalize_session_id(session_id)
+    return [
+        session_file
+        for session_file in discover_session_files(sessions_dir)
+        if session_file.session_id
+        and normalize_session_id(session_file.session_id) == normalized_id
+    ]
+
+
+def existing_index_record_for_id(
+    records: Sequence[Any], session_id: str
+) -> tuple[int, dict[str, Any]] | None:
+    normalized_id = normalize_session_id(session_id)
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        record_id = session_index_record_id(record)
+        if record_id and normalize_session_id(record_id) == normalized_id:
+            return index, record
+    return None
+
+
+def format_fingerprint(fingerprint: FileFingerprint) -> str:
+    return f"{fingerprint.size} bytes, sha256 {short_sha256(fingerprint)}"
+
+
+def first_existing_rollout_for_import(
+    existing_files: Sequence[SessionFile], target_path: Path
+) -> Path | None:
+    if target_path.exists():
+        return target_path
+    return existing_files[0].path if existing_files else None
+
+
+def prepare_import_rollout_records(
+    source_path: Path, session_id: str, thread_name: str
+) -> tuple[list[dict[str, Any]], bool]:
+    records = read_rollout_records(source_path)
+    updated_records, _, changed = renamed_rollout_records(records, session_id, thread_name)
+    return updated_records, changed
+
+
+def plan_bare_rollout_import(
+    source_path: Path,
+    codex_home: Path,
+    session_index_path: Path | None = None,
+    sessions_dir: Path | None = None,
+    *,
+    name: str | None = None,
+) -> ImportSessionPlan:
+    expanded_source_path = source_path.expanduser().resolve()
+    if not expanded_source_path.exists():
+        raise CliError(f"Input file not found: {source_path}")
+    if not expanded_source_path.is_file():
+        raise CliError(f"Input path is not a file: {source_path}")
+
+    resolved_sessions_dir = sessions_dir or codex_home / "sessions"
+    document = build_search_document(expanded_source_path, "...")
+    if document.session_id is None:
+        raise CliError(f"Cannot infer session id from rollout: {source_path}")
+
+    target_path = import_target_path(expanded_source_path, resolved_sessions_dir, document)
+    source_fingerprint = file_fingerprint(expanded_source_path)
+    existing_files = existing_session_files_for_id(document.session_id, resolved_sessions_dir)
+    existing_rollout_path = first_existing_rollout_for_import(existing_files, target_path)
+    existing_rollout_fingerprint = (
+        file_fingerprint(existing_rollout_path) if existing_rollout_path is not None else None
+    )
+
+    if existing_rollout_path is not None:
+        if source_fingerprint == existing_rollout_fingerprint:
+            raise CliError(
+                "Session already imported with identical rollout file: "
+                f"{existing_rollout_path} ({format_fingerprint(source_fingerprint)})"
+            )
+        existing_fingerprint = (
+            format_fingerprint(existing_rollout_fingerprint)
+            if existing_rollout_fingerprint
+            else "UNKNOWN"
+        )
+        raise CliError(
+            "Session already imported, but rollout file differs. "
+            f"Existing: {existing_rollout_path} "
+            f"({existing_fingerprint}); "
+            f"import: {expanded_source_path} ({format_fingerprint(source_fingerprint)})."
+        )
+
+    index_path = session_index_path or codex_home / "session_index.jsonl"
+    index_records = session_index_records(index_path) if index_path.exists() else []
+    existing_index_match = existing_index_record_for_id(index_records, document.session_id)
+    existing_index_thread_name = (
+        session_index_record_thread_name(existing_index_match[1])
+        if existing_index_match is not None
+        else None
+    )
+
+    if name is not None:
+        normalized_name = name.strip()
+    elif existing_index_thread_name:
+        normalized_name = existing_index_thread_name
+    else:
+        normalized_name = inferred_thread_name(document)
+    if not normalized_name:
+        raise CliError("Imported session title must not be empty.")
+
+    if existing_index_match is None:
+        index_action = "add"
+    elif existing_index_thread_name != normalized_name and name is not None:
+        index_action = "update"
+    else:
+        index_action = "keep"
+
+    _, rollout_will_be_rewritten = prepare_import_rollout_records(
+        expanded_source_path, document.session_id, normalized_name
+    )
+
+    return ImportSessionPlan(
+        source_path=expanded_source_path,
+        target_path=target_path,
+        session_index_path=index_path,
+        session_id=document.session_id,
+        thread_name=normalized_name,
+        started_at=document.started_at,
+        ended_at=document.ended_at,
+        index_action=index_action,
+        existing_index_thread_name=existing_index_thread_name,
+        source_fingerprint=source_fingerprint,
+        rollout_will_be_rewritten=rollout_will_be_rewritten,
+    )
+
+
+def session_index_record_for_import_plan(plan: ImportSessionPlan) -> dict[str, str]:
+    return {
+        "id": plan.session_id,
+        "thread_name": plan.thread_name,
+        "updated_at": format_session_index_timestamp(plan.ended_at or plan.started_at),
+    }
+
+
+def session_index_records_for_import(plan: ImportSessionPlan) -> list[Any]:
+    records = (
+        session_index_records(plan.session_index_path) if plan.session_index_path.exists() else []
+    )
+    existing_index_match = existing_index_record_for_id(records, plan.session_id)
+    if plan.index_action == "add":
+        if existing_index_match is not None:
+            return records
+        return [*records, session_index_record_for_import_plan(plan)]
+    if plan.index_action == "update":
+        if existing_index_match is None:
+            raise CliError(f"No session_index.jsonl entry found for ID: {plan.session_id}")
+        record_index, record = existing_index_match
+        updated_records = list(records)
+        updated_record = dict(record)
+        updated_record["thread_name"] = plan.thread_name
+        updated_records[record_index] = updated_record
+        return updated_records
+    return records
+
+
+def copy_or_rewrite_import_rollout(plan: ImportSessionPlan) -> None:
+    plan.target_path.parent.mkdir(parents=True, exist_ok=True)
+    if plan.rollout_will_be_rewritten:
+        records, _ = prepare_import_rollout_records(
+            plan.source_path, plan.session_id, plan.thread_name
+        )
+        write_rollout_records(plan.target_path, records)
+        return
+    shutil.copy2(plan.source_path, plan.target_path)
+
+
+def import_bare_rollout(
+    source_path: Path,
+    codex_home: Path,
+    session_index_path: Path | None = None,
+    sessions_dir: Path | None = None,
+    *,
+    name: str | None = None,
+) -> ImportSessionResult:
+    plan = plan_bare_rollout_import(
+        source_path=source_path,
+        codex_home=codex_home,
+        session_index_path=session_index_path,
+        sessions_dir=sessions_dir,
+        name=name,
+    )
+    index_changed = plan.index_action in {"add", "update"}
+    updated_index_records = session_index_records_for_import(plan) if index_changed else None
+
+    label = backup_label()
+    backup_dir = backup_dir_for(codex_home, label)
+    index_backup_path = (
+        backup_session_index(plan.session_index_path, backup_dir) if index_changed else None
+    )
+    rollout_written = False
+    try:
+        if index_changed:
+            if updated_index_records is None:
+                raise CliError("Could not prepare session_index.jsonl update.")
+            plan.session_index_path.parent.mkdir(parents=True, exist_ok=True)
+            write_session_index_records(plan.session_index_path, updated_index_records)
+        copy_or_rewrite_import_rollout(plan)
+        rollout_written = True
+        state_cache_backups = reset_codex_state_cache(codex_home, backup_dir)
+    except (CliError, CodexStateError, OSError) as exc:
+        try:
+            if rollout_written or plan.target_path.exists():
+                restore_file_backup(plan.target_path, None)
+            if index_changed:
+                restore_session_index_backup(plan.session_index_path, index_backup_path)
+            remove_backup_dir_if_empty(backup_dir)
+        except OSError as restore_exc:
+            raise CliError(
+                f"{exc} Also failed to restore Codex session files from backup: {restore_exc}"
+            ) from restore_exc
+        raise CliError(
+            f"{exc} Rolled back imported Codex session files. Close all Codex sessions and retry."
+        ) from exc
+
+    return ImportSessionResult(
+        plan=plan,
+        session_index_backup_path=index_backup_path,
+        state_cache_backups=state_cache_backups,
+    )
 
 
 def first_inferred_title_with_prefix(lines: Sequence[str], prefix: str) -> str | None:
@@ -3485,6 +3835,114 @@ def run_rename_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def import_index_action_label(action: str) -> str:
+    if action == "add":
+        return "add session_index.jsonl entry"
+    if action == "update":
+        return "update session_index.jsonl title"
+    if action == "keep":
+        return "keep existing session_index.jsonl entry"
+    return action
+
+
+def import_rollout_action_label(plan: ImportSessionPlan) -> str:
+    if plan.rollout_will_be_rewritten:
+        return "copy with rollout title event update"
+    return "copy unchanged"
+
+
+def format_import_plan_lines(plan: ImportSessionPlan) -> list[str]:
+    lines = [
+        f"Import source: {plan.source_path}",
+        f"Session: {plan.session_id} - {plan.thread_name}",
+        (
+            "Started: "
+            f"{format_local_timestamp(plan.started_at)} - "
+            f"Updated: {format_local_timestamp(plan.ended_at)} "
+            f"({local_timezone_offset_label(plan.ended_at or plan.started_at)})"
+        ),
+        f"Target rollout: {plan.target_path}",
+        f"Source fingerprint: {format_fingerprint(plan.source_fingerprint)}",
+        f"Index action: {import_index_action_label(plan.index_action)}",
+        f"Rollout action: {import_rollout_action_label(plan)}",
+        "State cache reset required after import.",
+    ]
+    if plan.existing_index_thread_name and plan.existing_index_thread_name != plan.thread_name:
+        lines.insert(
+            3,
+            f"Existing session_index.jsonl title: {plan.existing_index_thread_name}",
+        )
+    return lines
+
+
+def run_import_command(args: argparse.Namespace) -> int:
+    codex_home = args.codex_home.expanduser().resolve()
+    session_index_path = (
+        args.session_index.expanduser().resolve()
+        if args.session_index
+        else codex_home / "session_index.jsonl"
+    )
+    sessions_dir = (
+        args.sessions_dir.expanduser().resolve() if args.sessions_dir else codex_home / "sessions"
+    )
+
+    if args.dry_run:
+        try:
+            plan = plan_bare_rollout_import(
+                source_path=args.input,
+                codex_home=codex_home,
+                session_index_path=session_index_path,
+                sessions_dir=sessions_dir,
+                name=args.name,
+            )
+        except (CliError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        for line in format_import_plan_lines(plan):
+            print(encode_for_output(line, sys.stdout.encoding))
+        return 0
+
+    try:
+        result = import_bare_rollout(
+            source_path=args.input,
+            codex_home=codex_home,
+            session_index_path=session_index_path,
+            sessions_dir=sessions_dir,
+            name=args.name,
+        )
+    except (CliError, CodexStateError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+    plan = result.plan
+    print(
+        encode_for_output(
+            f"Imported session: {plan.session_id} - {plan.thread_name}",
+            sys.stdout.encoding,
+        )
+    )
+    print(
+        encode_for_output(f"Rollout: {plan.source_path} -> {plan.target_path}", sys.stdout.encoding)
+    )
+    print(
+        encode_for_output(
+            f"Index action: {import_index_action_label(plan.index_action)}", sys.stdout.encoding
+        )
+    )
+    print(
+        encode_for_output(
+            f"Rollout action: {import_rollout_action_label(plan)}", sys.stdout.encoding
+        )
+    )
+    if result.session_index_backup_path is not None:
+        print(f"Session index backup: {result.session_index_backup_path}")
+    if result.state_cache_backups:
+        print("State cache backups:")
+        for backup in result.state_cache_backups:
+            print(f"{backup.original_path} -> {backup.backup_path}")
+    else:
+        print("No Codex state cache files found to reset.")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     prog = cli_prog_from_argv0()
@@ -3496,6 +3954,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_repair_index_command(parse_repair_index_args(raw_argv[1:], prog))
     if raw_argv[:1] == ["rename"]:
         return run_rename_command(parse_rename_args(raw_argv[1:], prog))
+    if raw_argv[:1] == ["import"]:
+        return run_import_command(parse_import_args(raw_argv[1:], prog))
 
     args = parse_args(raw_argv, prog)
     codex_home = args.codex_home.expanduser().resolve()

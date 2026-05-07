@@ -176,6 +176,26 @@ resets Codex state cache. You can use an exact current title instead of an ID,
 but if multiple sessions have that title the command will ask you to rerun with
 one concrete ID.
 
+Import a bare rollout JSONL file into Codex home:
+
+```bash
+codex-sessions import ./rollout-2026-04-30T18-20-39-019ddf68-2bc0-75e2-aecb-22f49ca63c98.jsonl
+```
+
+Preview the target path and index action without writing anything:
+
+```bash
+codex-sessions import --dry-run ./rollout.jsonl
+```
+
+`import` copies the rollout into `sessions/YYYY/MM/DD/`, adds or updates the
+matching `session_index.jsonl` entry when needed, updates the rollout title
+event to match the chosen title, and resets Codex state cache after making
+backups under `backups/codex-sessions/`. Use `--name` to set the imported
+title explicitly. If the session rollout is already present, import refuses to
+continue and reports whether the existing file is identical or differs by size
+and SHA-256.
+
 Search all Codex sessions:
 
 ```bash

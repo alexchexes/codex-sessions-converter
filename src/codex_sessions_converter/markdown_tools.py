@@ -9,6 +9,8 @@ from codex_sessions_converter.markdown_formatting import (
 )
 from codex_sessions_converter.markdown_images import MarkdownImageHandler
 
+DEFAULT_TOOL_PREVIEW_CHARS = 700
+
 
 def parse_json_object_maybe(value: Any) -> dict[str, Any] | None:
     if isinstance(value, dict):

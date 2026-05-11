@@ -14,18 +14,20 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from codex_sessions_converter.converter import (  # noqa: E402
-    MarkdownOptions,
     cli_prog_from_argv0,
-    convert_jsonl_to_markdown,
     default_output_path,
     format_local_timestamp,
     list_session_lines,
     local_timezone_offset_label,
     main,
     parse_markdown_include,
-    render_reasoning,
     resolve_markdown_tool_mode,
     resolve_output_path,
+)
+from codex_sessions_converter.markdown_output import (  # noqa: E402
+    MarkdownOptions,
+    convert_jsonl_to_markdown,
+    render_reasoning,
 )
 from codex_sessions_converter.search_cache import search_cache_path  # noqa: E402
 from codex_sessions_converter.search_output import (  # noqa: E402
@@ -967,7 +969,7 @@ class ConverterTests(unittest.TestCase):
             self.assertTrue(search_cache_path(codex_home).exists())
 
             with patch(
-                "codex_sessions_converter.converter.iter_jsonl_objects",
+                "codex_sessions_converter.session_documents.iter_jsonl_objects",
                 side_effect=AssertionError("list should reuse cached session metadata"),
             ):
                 second_lines = list_session_lines(codex_home)
@@ -3162,7 +3164,7 @@ class ConverterTests(unittest.TestCase):
             self.assertTrue(search_cache_path(codex_home).exists())
 
             with patch(
-                "codex_sessions_converter.converter.iter_jsonl_objects",
+                "codex_sessions_converter.session_documents.iter_jsonl_objects",
                 side_effect=AssertionError("cache should avoid reparsing rollout JSONL"),
             ):
                 buffer = StringIO()

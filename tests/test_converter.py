@@ -19,9 +19,7 @@ from codex_sessions_converter.conversion_paths import (  # noqa: E402
 )
 from codex_sessions_converter.converter import (  # noqa: E402
     cli_prog_from_argv0,
-    format_local_timestamp,
     list_session_lines,
-    local_timezone_offset_label,
     main,
     parse_markdown_include,
     resolve_markdown_tool_mode,
@@ -35,6 +33,10 @@ from codex_sessions_converter.search_cache import search_cache_path  # noqa: E40
 from codex_sessions_converter.search_output import (  # noqa: E402
     console_color_options,
     encode_for_output,
+)
+from codex_sessions_converter.session_display import (  # noqa: E402
+    format_local_timestamp,
+    local_timezone_offset_label,
 )
 from codex_sessions_converter.timestamps import parse_timestamp  # noqa: E402
 from codex_sessions_converter.yaml_output import convert_jsonl_to_yaml_stream  # noqa: E402

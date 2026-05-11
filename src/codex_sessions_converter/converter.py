@@ -4,7 +4,6 @@ import binascii
 import errno
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -89,11 +88,11 @@ from codex_sessions_converter.transfer import (
     rollout_filename_date,
     write_rollout_records,
 )
+from codex_sessions_converter.yaml_output import convert_jsonl_to_yaml_stream
 
 __version__ = "0.1.0"
 
 
-SIMPLE_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 NO_ROLLOUT_FILE = "NO ROLLOUT FILE"
 NO_SESSION_INDEX_ENTRY = "NO ENTRY IN session_index.jsonl"
 MARKDOWN_FEATURES = {"tools", "metadata", "raw"}
@@ -1770,101 +1769,6 @@ def repair_session_index(
         session_index_backup_path=index_backup_path,
         state_cache_backups=state_cache_backups,
     )
-
-
-def render_key(key: str) -> str:
-    if SIMPLE_KEY_RE.match(key):
-        return key
-    return json.dumps(key, ensure_ascii=False)
-
-
-def render_scalar(value: Any) -> str:
-    if value is None:
-        return "null"
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            return json.dumps(value)
-        return json.dumps(value)
-    return json.dumps(value, ensure_ascii=False)
-
-
-def block_style_lines(text: str) -> tuple[str, list[str]]:
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    trailing_newlines = len(normalized) - len(normalized.rstrip("\n"))
-    if trailing_newlines == 0:
-        header = "|-"
-    elif trailing_newlines == 1:
-        header = "|"
-    else:
-        header = "|+"
-
-    lines = normalized.split("\n")
-    if normalized.endswith("\n"):
-        lines = lines[:-1]
-    if not lines:
-        lines = [""]
-    return header, lines
-
-
-def is_multiline_string(value: Any) -> bool:
-    return isinstance(value, str) and ("\n" in value or "\r" in value)
-
-
-def dump_yaml_lines(value: Any, indent: int = 0) -> list[str]:
-    prefix = " " * indent
-
-    if isinstance(value, dict):
-        if not value:
-            return [prefix + "{}"]
-        lines = []
-        for key, inner in value.items():
-            rendered_key = render_key(key)
-            if is_multiline_string(inner):
-                header, block_lines = block_style_lines(inner)
-                lines.append(f"{prefix}{rendered_key}: {header}")
-                lines.extend((" " * (indent + 2)) + line for line in block_lines)
-            elif isinstance(inner, (dict, list)):
-                lines.append(f"{prefix}{rendered_key}:")
-                lines.extend(dump_yaml_lines(inner, indent + 2))
-            else:
-                lines.append(f"{prefix}{rendered_key}: {render_scalar(inner)}")
-        return lines
-
-    if isinstance(value, list):
-        if not value:
-            return [prefix + "[]"]
-        lines = []
-        for item in value:
-            if is_multiline_string(item):
-                header, block_lines = block_style_lines(item)
-                lines.append(f"{prefix}- {header}")
-                lines.extend((" " * (indent + 2)) + line for line in block_lines)
-            elif isinstance(item, (dict, list)):
-                lines.append(prefix + "-")
-                lines.extend(dump_yaml_lines(item, indent + 2))
-            else:
-                lines.append(f"{prefix}- {render_scalar(item)}")
-        return lines
-
-    return [prefix + render_scalar(value)]
-
-
-def convert_jsonl_to_yaml_stream(input_path: Path, output_path: Path, redaction: str) -> int:
-    count = 0
-    with output_path.open("w", encoding="utf-8", newline="\n") as dst:
-        for _, obj in iter_jsonl_objects(input_path):
-            sanitized = sanitize(obj, redaction)
-            dst.write("---\n")
-            dst.write("\n".join(dump_yaml_lines(sanitized)))
-            dst.write("\n")
-            count += 1
-    return count
 
 
 def parse_markdown_include(spec: str) -> set[str]:

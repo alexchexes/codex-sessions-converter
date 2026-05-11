@@ -17,7 +17,6 @@ from codex_sessions_converter.converter import (  # noqa: E402
     MarkdownOptions,
     cli_prog_from_argv0,
     convert_jsonl_to_markdown,
-    convert_jsonl_to_yaml_stream,
     default_output_path,
     format_local_timestamp,
     list_session_lines,
@@ -34,6 +33,7 @@ from codex_sessions_converter.search_output import (  # noqa: E402
     encode_for_output,
 )
 from codex_sessions_converter.timestamps import parse_timestamp  # noqa: E402
+from codex_sessions_converter.yaml_output import convert_jsonl_to_yaml_stream  # noqa: E402
 
 
 def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:

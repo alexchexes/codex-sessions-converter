@@ -29,8 +29,8 @@ from codex_sessions_converter.converter import (  # noqa: E402
     render_reasoning,
     resolve_markdown_tool_mode,
     resolve_output_path,
-    search_cache_path,
 )
+from codex_sessions_converter.search_cache import search_cache_path  # noqa: E402
 from codex_sessions_converter.timestamps import parse_timestamp  # noqa: E402
 
 

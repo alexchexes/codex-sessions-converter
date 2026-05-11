@@ -362,6 +362,13 @@ Run the test suite:
 python -m unittest discover -s tests
 ```
 
+Run the test suite with coverage:
+
+```bash
+python -m coverage run -m unittest discover -s tests
+python -m coverage report -m
+```
+
 Run formatting, linting, and type checks:
 
 ```bash

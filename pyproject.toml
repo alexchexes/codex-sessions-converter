@@ -29,6 +29,7 @@ classifiers = [
 
 [project.optional-dependencies]
 dev = [
+  "coverage[toml]>=7.6",
   "mypy>=1.10",
   "ruff>=0.5"
 ]
@@ -52,3 +53,11 @@ python_version = "3.10"
 strict = true
 warn_unreachable = true
 files = ["src", "tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["codex_sessions_converter"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
